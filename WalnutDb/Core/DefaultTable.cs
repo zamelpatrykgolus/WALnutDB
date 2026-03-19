@@ -15,14 +15,14 @@ internal sealed class DefaultTable<T> : ITable<T>
     private readonly WalnutDatabase _db;
     private readonly string _name;
     private readonly TableMapper<T> _map;
-    private readonly MemTableRef _memRef;
+    private MemTableRef _memRef;
 
     private sealed class IndexDef
     {
         public required string Name { get; init; }
         public required Func<T, object?> Extract { get; init; }
         public required string IndexTableName { get; init; }
-        public required MemTableRef Mem { get; init; }
+        public required MemTableRef Mem { get; set; }
         public int? DecimalScale { get; init; }
         public bool Unique { get; init; }
     }
@@ -57,6 +57,14 @@ internal sealed class DefaultTable<T> : ITable<T>
         }
 
         RecoverMissingIndexesIfNeeded();
+    }
+
+    private void EnsureTableRegistered()
+    {
+        _memRef = _db.ReattachTable(_name, _memRef);
+
+        foreach (var idx in _indexes)
+            idx.Mem = _db.ReattachIndex(idx.IndexTableName, idx.Mem, idx.Unique);
     }
 
     private void RecoverMissingIndexesIfNeeded()
@@ -224,6 +232,8 @@ internal sealed class DefaultTable<T> : ITable<T>
 
     public async ValueTask<bool> UpsertAsync(T item, ITransaction txHandle, CancellationToken ct = default)
     {
+        EnsureTableRegistered();
+
         if (txHandle is not WalnutTransaction tx)
             throw new InvalidOperationException("Unknown transaction type.");
 
@@ -433,6 +443,8 @@ internal sealed class DefaultTable<T> : ITable<T>
 
     public async ValueTask<bool> DeleteAsync(object id, ITransaction txHandle, CancellationToken ct = default)
     {
+        EnsureTableRegistered();
+
         if (txHandle is not WalnutTransaction tx)
             throw new InvalidOperationException("Unknown transaction type.");
 
@@ -497,6 +509,8 @@ internal sealed class DefaultTable<T> : ITable<T>
 
     public ValueTask<bool> DeleteAsync(T item, ITransaction txHandle, CancellationToken ct = default)
     {
+        EnsureTableRegistered();
+
         if (txHandle is not WalnutTransaction tx)
             throw new InvalidOperationException("Unknown transaction type.");
 
@@ -561,6 +575,8 @@ internal sealed class DefaultTable<T> : ITable<T>
 
     public ValueTask<T?> GetAsync(object id, CancellationToken ct = default)
     {
+        EnsureTableRegistered();
+
         var key = _map.EncodeIdToBytes(id);
 
         if (_memRef.Current.TryGet(key, out var raw) && raw is not null)
@@ -626,6 +642,8 @@ internal sealed class DefaultTable<T> : ITable<T>
         ReadOnlyMemory<byte> token = default,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
+        EnsureTableRegistered();
+
         var from = fromInclusive.IsEmpty ? Array.Empty<byte>() : fromInclusive.ToArray();
         var to = toExclusive.IsEmpty ? Array.Empty<byte>() : toExclusive.ToArray();
         var after = token.IsEmpty ? null : token.ToArray();
@@ -686,6 +704,8 @@ internal sealed class DefaultTable<T> : ITable<T>
     ReadOnlyMemory<byte> token = default,
     [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
+        EnsureTableRegistered();
+
         var idx = _indexes.Find(i => string.Equals(i.Name, hint.IndexName, StringComparison.Ordinal));
 
         if (idx is null)

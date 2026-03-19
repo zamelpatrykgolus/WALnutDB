@@ -699,6 +699,22 @@ public sealed class WalnutDatabase : IDatabase
     internal MemTableRef GetOrAddMemRef(string name)
     => _tables.GetOrAdd(name, _ => new MemTableRef(new MemTable()));
 
+    internal MemTableRef ReattachTable(string name, MemTableRef preferred)
+    {
+        var canonical = CanonicalizeName(name);
+        var current = _tables.AddOrUpdate(canonical, preferred, static (_, existing) => existing);
+        _metrics.GetOrAdd(canonical, _ => new TableMetrics());
+        return current;
+    }
+
+    internal MemTableRef ReattachIndex(string indexTableName, MemTableRef preferred, bool unique)
+    {
+        var canonical = CanonicalizeName(indexTableName);
+        var current = ReattachTable(canonical, preferred);
+        _indexUnique[canonical] = unique;
+        return current;
+    }
+
     // (opcjonalnie dla zgodności – jeśli coś jeszcze woła starą wersję)
     internal MemTable GetOrAddMemTable(string name) => GetOrAddMemRef(name).Current;
 

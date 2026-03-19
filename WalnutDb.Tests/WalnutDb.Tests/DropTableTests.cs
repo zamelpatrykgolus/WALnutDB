@@ -95,6 +95,36 @@ public sealed class DropTableTests
     }
 
     [Fact]
+    public async Task DropTable_Old_Table_Handle_Can_Persist_New_Data_Across_Reopen()
+    {
+        var dir = NewTempDir("drop-handle-reopen");
+        const string Tbl = "drop-users-handle-reopen";
+        var walPath = Path.Combine(dir, "wal.log");
+
+        await using (var wal = new WalWriter(walPath))
+        {
+            await using var db = new WalnutDatabase(dir, new DatabaseOptions(), new FileSystemManifestStore(dir), wal);
+
+            var tbl = await db.OpenTableAsync<UxUser>(Tbl, new TableOptions<UxUser> { GetId = u => u.Id });
+            await tbl.UpsertAsync(new UxUser { Id = "seed", Email = "support@support" });
+
+            await db.DropTableAsync(Tbl);
+
+            // Simulates application code that keeps the original handle after deleting the table.
+            await tbl.UpsertAsync(new UxUser { Id = "after", Email = "support@support" });
+            await db.CheckpointAsync();
+        }
+
+        await using var wal2 = new WalWriter(walPath);
+        await using var db2 = new WalnutDatabase(dir, new DatabaseOptions(), new FileSystemManifestStore(dir), wal2);
+        var tbl2 = await db2.OpenTableAsync<UxUser>(Tbl, new TableOptions<UxUser> { GetId = u => u.Id });
+
+        var docs = await tbl2.QueryAsync(_ => true).ToListAsync();
+        Assert.Single(docs);
+        Assert.Equal("after", docs[0].Id);
+    }
+
+    [Fact]
     public async Task DropTable_Persists_Across_Reopen()
     {
         var dir = NewTempDir("drop-reopen");
