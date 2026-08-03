@@ -18,7 +18,12 @@ internal sealed class WalnutTransaction : WalnutDb.ITransaction
     private readonly List<Action> _applyActions = new();
     // Akcje uruchamiane przy Dispose, gdy transakcja nie została zatwierdzona
     private readonly List<Action> _rollbackActions = new();
-    private bool _committed;
+    private readonly Dictionary<string, byte[]?> _pendingValues = new(StringComparer.Ordinal);
+    private const int Active = 0;
+    private const int Committing = 1;
+    private const int Committed = 2;
+    private const int Disposed = 3;
+    private int _state;
 
     internal WalnutTransaction(WalnutDatabase db, ulong txId, ulong seqNo)
     {
@@ -27,22 +32,56 @@ internal sealed class WalnutTransaction : WalnutDb.ITransaction
 
     public async ValueTask CommitAsync(WalnutDb.Durability durability = WalnutDb.Durability.Safe, CancellationToken ct = default)
     {
-        _frames.Insert(0, Wal.WalCodec.BuildBegin(_txId, _seqNo));
-        _frames.Add(Wal.WalCodec.BuildCommit(_txId, _ops));
+        if (Interlocked.CompareExchange(ref _state, Committing, Active) != Active)
+            throw new InvalidOperationException("Transaction is no longer active.");
 
-        // Wyślij całą transakcję do WAL
-        var handle = await _db.Wal.AppendTransactionAsync(_frames, durability, ct).ConfigureAwait(false);
+        AsyncReadWriteGate.Lease maintenanceLease;
+        try
+        {
+            maintenanceLease = await _db.MaintenanceGate.EnterReadAsync(ct).ConfigureAwait(false);
+        }
+        catch
+        {
+            Interlocked.CompareExchange(ref _state, Active, Committing);
+            throw;
+        }
+        await using var _ = maintenanceLease;
+        if (_db.IsDisposing)
+        {
+            Interlocked.CompareExchange(ref _state, Active, Committing);
+            throw new ObjectDisposedException(nameof(WalnutDatabase));
+        }
 
-        // Trwałość: dla Safe/Group poczekaj aż batch zostanie zfsyncowany
-        if (durability is WalnutDb.Durability.Safe or WalnutDb.Durability.Group)
-            await handle.WhenCommitted.ConfigureAwait(false);
+        var commitFrames = new List<ReadOnlyMemory<byte>>(_frames.Count + 2)
+        {
+            Wal.WalCodec.BuildBegin(_txId, _seqNo)
+        };
+        commitFrames.AddRange(_frames);
+        commitFrames.Add(Wal.WalCodec.BuildCommit(_txId, _ops));
 
-        // Zastosuj zmiany do MemTable w sekcji single-writer
-        await _db.WriterLock.WaitAsync(ct).ConfigureAwait(false);
+        CommitHandle handle;
+        try
+        {
+            // Wyślij całą transakcję do WAL
+            handle = await _db.Wal.AppendTransactionAsync(commitFrames, durability, ct).ConfigureAwait(false);
+
+            // Trwałość: dla Safe/Group poczekaj aż batch zostanie zfsyncowany
+            if (durability is WalnutDb.Durability.Safe or WalnutDb.Durability.Group)
+                await handle.WhenCommitted.ConfigureAwait(false);
+        }
+        catch
+        {
+            Interlocked.CompareExchange(ref _state, Active, Committing);
+            throw;
+        }
+
+        // COMMIT może być już trwały. Od tej chwili anulowanie nie może
+        // pozostawić bieżącego procesu ze stanem innym niż recovery po restarcie.
+        await _db.WriterLock.WaitAsync(CancellationToken.None).ConfigureAwait(false);
         try
         {
             foreach (var act in _applyActions) act();
-            _committed = true;
+            Volatile.Write(ref _state, Committed);
         }
         finally
         {
@@ -51,41 +90,46 @@ internal sealed class WalnutTransaction : WalnutDb.ITransaction
     }
     public void Dispose()
     {
-        if (!_committed)
+        var previous = Interlocked.Exchange(ref _state, Disposed);
+        if (previous == Active)
             foreach (var act in _rollbackActions) act();
     }
 
     public ValueTask DisposeAsync() { Dispose(); return ValueTask.CompletedTask; }
 
     // ---- używane przez DefaultTable<T> ----
-    internal void AddApply(Action action) => _applyActions.Add(action);
-    internal void AddRollback(Action action) => _rollbackActions.Add(action);
+    private void EnsureActive()
+    {
+        if (Volatile.Read(ref _state) != Active)
+            throw new InvalidOperationException("Transaction is no longer active.");
+    }
+
+    internal void AddApply(Action action) { EnsureActive(); _applyActions.Add(action); }
+    internal void AddRollback(Action action) { EnsureActive(); _rollbackActions.Add(action); }
     internal void AddPut(string table, byte[] key, byte[] value)
     {
+        EnsureActive();
         _frames.Add(Wal.WalCodec.BuildPut(_txId, table, key, value));
         _ops++;
     }
     internal void AddDelete(string table, byte[] key)
     {
+        EnsureActive();
         _frames.Add(Wal.WalCodec.BuildDelete(_txId, table, key));
         _ops++;
     }
+    internal bool TryGetPendingValue(string table, byte[] key, out byte[]? value)
+        => _pendingValues.TryGetValue(PendingKey(table, key), out value);
+
+    internal void SetPendingValue(string table, byte[] key, byte[]? value)
+    {
+        EnsureActive();
+        _pendingValues[PendingKey(table, key)] = value;
+    }
+
+    private static string PendingKey(string table, byte[] key)
+        => table + "|" + Convert.ToBase64String(key);
     internal ulong TxId => _txId;
     internal ulong SeqNo => _seqNo;
-
-    // Bardzo prosty format ramek (na teraz wystarczy, testy tylko sprawdzają 1. bajt op-code)
-    private static class WalFrame
-    {
-        public static ReadOnlyMemory<byte> Begin(ulong txId, ulong seqNo)
-            => new byte[] { (byte)WalOp.Begin }; // możesz rozszerzyć później
-
-        public static ReadOnlyMemory<byte> Put(string table, byte[] key, byte[] value)
-            => new byte[] { (byte)WalOp.Put };
-
-        public static ReadOnlyMemory<byte> Delete(string table, byte[] key)
-            => new byte[] { (byte)WalOp.Delete };
-
-        public static ReadOnlyMemory<byte> Commit(ulong txId)
-            => new byte[] { (byte)WalOp.Commit };
-    }
+    internal bool BelongsTo(WalnutDatabase database) => ReferenceEquals(_db, database);
 }

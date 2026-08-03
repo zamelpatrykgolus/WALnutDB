@@ -2,6 +2,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Reflection;
 using System.Threading.Tasks;
 
 using WalnutDb;
@@ -75,14 +76,29 @@ public sealed class WalWriterTests
         Assert.Equal((byte)WalOp.Commit, frames[frames.Count - 1].Span[0]);
     }
 
+    [Fact]
+    public async Task WalWriter_FaultedLoop_FailsFlushInsteadOfWaitingForever()
+    {
+        var dir = NewTempDir();
+        await using var writer = new WalWriter(Path.Combine(dir, "wal.log"));
+        var field = typeof(WalWriter).GetField("_fs", BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(field);
+        ((FileStream)field!.GetValue(writer)!).Dispose();
+
+        var handle = await writer.AppendTransactionAsync(SimpleTx(), Durability.Safe);
+        await Assert.ThrowsAnyAsync<Exception>(() => handle.WhenCommitted.AsTask().WaitAsync(TimeSpan.FromSeconds(2)));
+        await Assert.ThrowsAsync<IOException>(() => writer.FlushAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(2)));
+    }
+
     private static List<ReadOnlyMemory<byte>> ReadWalFrames(string path)
     {
         var list = new List<ReadOnlyMemory<byte>>();
         using var fs = File.OpenRead(path);
+        Span<byte> lenBuf = stackalloc byte[4];
+        Span<byte> crcBuf = stackalloc byte[4];
         while (fs.Position + 8 <= fs.Length)
         {
             // len
-            Span<byte> lenBuf = stackalloc byte[4];
             var r1 = fs.Read(lenBuf);
             if (r1 != 4) break;
             uint len = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(lenBuf);
@@ -93,7 +109,6 @@ public sealed class WalWriterTests
             if (r2 != payload.Length) break;
 
             // crc (ignorujemy, ale przesuwamy)
-            Span<byte> crcBuf = stackalloc byte[4];
             var r3 = fs.Read(crcBuf);
             if (r3 != 4) break;
 

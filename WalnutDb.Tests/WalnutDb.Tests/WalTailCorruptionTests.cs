@@ -15,6 +15,7 @@ file sealed class CorruptDoc
 
 public sealed class WalTailCorruptionTests
 {
+    private static readonly DatabaseOptions KeepWal = new() { CheckpointOnDispose = false };
     private static string NewTempDir()
     {
         var dir = Path.Combine(Path.GetTempPath(), "WalnutDbTests", "wal_tail_corrupt", Guid.NewGuid().ToString("N"));
@@ -29,7 +30,7 @@ public sealed class WalTailCorruptionTests
         var walPath = Path.Combine(dir, "wal.log");
 
         // 1) Napisz kilka ramek
-        await using (var db = new WalnutDatabase(dir, new DatabaseOptions(), new FileSystemManifestStore(dir), new WalWriter(walPath)))
+        await using (var db = new WalnutDatabase(dir, KeepWal, new FileSystemManifestStore(dir), new WalWriter(walPath)))
         {
             var t = await db.OpenTableAsync(new TableOptions<CorruptDoc> { GetId = d => d.Id });
             for (int i = 0; i < 50; i++)
@@ -41,7 +42,7 @@ public sealed class WalTailCorruptionTests
         await File.AppendAllTextAsync(walPath, "XYZ");
 
         // 3) Otwórz ponownie – nie powinno rzucać
-        await using (var db2 = new WalnutDatabase(dir, new DatabaseOptions(), new FileSystemManifestStore(dir), new WalWriter(walPath)))
+        await using (var db2 = new WalnutDatabase(dir, KeepWal, new FileSystemManifestStore(dir), new WalWriter(walPath)))
         {
             var t2 = await db2.OpenTableAsync(new TableOptions<CorruptDoc> { GetId = d => d.Id });
             int count = 0; await foreach (var _ in t2.GetAllAsync()) count++;
@@ -55,7 +56,7 @@ public sealed class WalTailCorruptionTests
         var dir = NewTempDir();
         var walPath = Path.Combine(dir, "wal.log");
 
-        await using (var db = new WalnutDatabase(dir, new DatabaseOptions(), new FileSystemManifestStore(dir), new WalWriter(walPath)))
+        await using (var db = new WalnutDatabase(dir, KeepWal, new FileSystemManifestStore(dir), new WalWriter(walPath)))
         {
             var t = await db.OpenTableAsync(new TableOptions<CorruptDoc> { GetId = d => d.Id });
             for (int i = 0; i < 5; i++)
@@ -81,7 +82,7 @@ public sealed class WalTailCorruptionTests
         WalnutLogger.OnWarning += Handler;
         try
         {
-            await using (var db2 = new WalnutDatabase(dir, new DatabaseOptions(), new FileSystemManifestStore(dir), new WalWriter(walPath)))
+            await using (var db2 = new WalnutDatabase(dir, KeepWal, new FileSystemManifestStore(dir), new WalWriter(walPath)))
             {
                 var t2 = await db2.OpenTableAsync(new TableOptions<CorruptDoc> { GetId = d => d.Id });
                 int count = 0; await foreach (var _ in t2.GetAllAsync()) count++;
@@ -104,7 +105,7 @@ public sealed class WalTailCorruptionTests
         var dir = NewTempDir();
         var walPath = Path.Combine(dir, "wal.log");
 
-        await using (var db = new WalnutDatabase(dir, new DatabaseOptions(), new FileSystemManifestStore(dir), new WalWriter(walPath)))
+        await using (var db = new WalnutDatabase(dir, KeepWal, new FileSystemManifestStore(dir), new WalWriter(walPath)))
         {
             var t = await db.OpenTableAsync(new TableOptions<CorruptDoc> { GetId = d => d.Id });
             for (int i = 0; i < 10; i++)
@@ -114,7 +115,7 @@ public sealed class WalTailCorruptionTests
 
         var baselineLength = new FileInfo(walPath).Length;
 
-        await using (var db2 = new WalnutDatabase(dir, new DatabaseOptions(), new FileSystemManifestStore(dir), new WalWriter(walPath)))
+        await using (var db2 = new WalnutDatabase(dir, KeepWal, new FileSystemManifestStore(dir), new WalWriter(walPath)))
         {
             var t2 = await db2.OpenTableAsync(new TableOptions<CorruptDoc> { GetId = d => d.Id });
             await t2.UpsertAsync(new CorruptDoc { Id = "corrupted" });
@@ -137,7 +138,7 @@ public sealed class WalTailCorruptionTests
             fs.Flush();
         }
 
-        await using (var db3 = new WalnutDatabase(dir, new DatabaseOptions(), new FileSystemManifestStore(dir), new WalWriter(walPath)))
+        await using (var db3 = new WalnutDatabase(dir, KeepWal, new FileSystemManifestStore(dir), new WalWriter(walPath)))
         {
             var t3 = await db3.OpenTableAsync(new TableOptions<CorruptDoc> { GetId = d => d.Id });
             var ids = new HashSet<string>();
@@ -156,7 +157,7 @@ public sealed class WalTailCorruptionTests
         var dir = NewTempDir();
         var walPath = Path.Combine(dir, "wal.log");
 
-        await using (var db = new WalnutDatabase(dir, new DatabaseOptions(), new FileSystemManifestStore(dir), new WalWriter(walPath)))
+        await using (var db = new WalnutDatabase(dir, KeepWal, new FileSystemManifestStore(dir), new WalWriter(walPath)))
         {
             var t = await db.OpenTableAsync(new TableOptions<CorruptDoc> { GetId = d => d.Id });
             await t.UpsertAsync(new CorruptDoc { Id = "before" });
@@ -174,7 +175,7 @@ public sealed class WalTailCorruptionTests
             await fs.FlushAsync();
         }
 
-        await using (var db2 = new WalnutDatabase(dir, new DatabaseOptions(), new FileSystemManifestStore(dir), new WalWriter(walPath)))
+        await using (var db2 = new WalnutDatabase(dir, KeepWal, new FileSystemManifestStore(dir), new WalWriter(walPath)))
         {
             var t2 = await db2.OpenTableAsync(new TableOptions<CorruptDoc> { GetId = d => d.Id });
             var docs = await MaterializeAsync(t2.GetAllAsync());
@@ -187,7 +188,7 @@ public sealed class WalTailCorruptionTests
 
         Assert.True(new FileInfo(walPath).Length > baseline);
 
-        await using (var db3 = new WalnutDatabase(dir, new DatabaseOptions(), new FileSystemManifestStore(dir), new WalWriter(walPath)))
+        await using (var db3 = new WalnutDatabase(dir, KeepWal, new FileSystemManifestStore(dir), new WalWriter(walPath)))
         {
             var t3 = await db3.OpenTableAsync(new TableOptions<CorruptDoc> { GetId = d => d.Id });
             var ids = (await MaterializeAsync(t3.GetAllAsync())).Select(d => d.Id).OrderBy(id => id).ToArray();

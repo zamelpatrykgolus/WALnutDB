@@ -155,7 +155,7 @@ public sealed class NightlySoakStressTests
             var msg = $"Final state mismatch: expectedAlive={expectedAlive.Count}, actualAlive={actualAlive.Count}\n" +
                       (missing.Length > 0 ? $"  Missing (in DB): {string.Join(",", missing)}\n" : "") +
                       (extra.Length > 0 ? $"  Extra   (in DB): {string.Join(",", extra)}\n" : "");
-            Assert.True(false, msg);
+            Assert.Fail(msg);
         }
 
         // B) sanity: wartości dla żyjących

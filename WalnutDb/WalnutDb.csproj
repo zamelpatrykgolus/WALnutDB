@@ -7,7 +7,7 @@
     <GeneratePackageOnBuild>True</GeneratePackageOnBuild>
     <PackageId>WALnutDB</PackageId>
     <Title>WALnutDB</Title>
-    <Version>1.0.17</Version>
+    <Version>1.0.19</Version>
     <Authors>Patryk Golus</Authors>
     <Company />
     <Description>WALnutDB is a simple, safe embedded database for .NET 8+. It’s built for devices with little RAM and slow flash (SD cards, eMMC). It uses Write-Ahead Logging (WAL) for power-loss durability, compacts data into sorted segment files (SST), and provides secondary indexes and time-series scans. Fully managed (no native deps), cross-platform, and async by default.

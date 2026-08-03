@@ -40,6 +40,7 @@ internal static class WalRecovery
         var pending = new Dictionary<ulong, List<Action>>();
         long lastGoodPosition = 0;
         bool truncateTail = false;
+        bool issueMayBeTail = true;
 
         string? truncateReason = null;
         while (fs.Position + 8 <= fs.Length) // min: len(4)+crc(4)
@@ -53,15 +54,16 @@ internal static class WalRecovery
                 break;
             }
             uint len = BinaryPrimitives.ReadUInt32LittleEndian(lenBuf);
-            if (len > fs.Length - fs.Position - 4)
+            if (len == 0 || len > int.MaxValue || len > fs.Length - fs.Position - 4)
             {
                 truncateReason = $"frame length {len} at offset {frameStart} exceeds remaining file size";
                 truncateTail = true;
+                issueMayBeTail = !ContainsValidFrameAfter(fs, frameStart + 1, crc);
                 break; // niepełna ramka → przerwij
             }
 
             // payload
-            var payload = new byte[len];
+            var payload = new byte[(int)len];
             if (!TryReadExactly(fs, payload))
             {
                 truncateReason = $"unexpected EOF while reading payload (len={len}) at offset {frameStart + 4}";
@@ -82,6 +84,7 @@ internal static class WalRecovery
             {
                 truncateReason = $"CRC mismatch at offset {frameStart}: stored=0x{fileCrc:X8}, computed=0x{calcCrc:X8}";
                 truncateTail = true;
+                issueMayBeTail = fs.Position == fs.Length;
                 break; // uszkodzona ramka → przerwij
             }
 
@@ -97,6 +100,7 @@ internal static class WalRecovery
                         {
                             truncateReason = $"BEGIN frame too short ({span.Length} bytes) at offset {frameStart}";
                             truncateTail = true;
+                            issueMayBeTail = false;
                             break;
                         }
                         ulong txId = BinaryPrimitives.ReadUInt64LittleEndian(span.Slice(1, 8));
@@ -110,6 +114,7 @@ internal static class WalRecovery
                         {
                             truncateReason = $"PUT frame too short ({span.Length} bytes) at offset {frameStart}";
                             truncateTail = true;
+                            issueMayBeTail = false;
                             break;
                         }
                         ulong txId = BinaryPrimitives.ReadUInt64LittleEndian(span.Slice(1, 8));
@@ -117,10 +122,11 @@ internal static class WalRecovery
                         int klen = BinaryPrimitives.ReadInt32LittleEndian(span.Slice(11, 4));
                         int vlen = BinaryPrimitives.ReadInt32LittleEndian(span.Slice(15, 4));
                         int off = 19;
-                        if (off + tlen + klen + vlen > span.Length)
+                        if (klen < 0 || vlen < 0 || (long)off + tlen + klen + vlen != span.Length)
                         {
                             truncateReason = $"PUT frame payload truncated at offset {frameStart}";
                             truncateTail = true;
+                            issueMayBeTail = false;
                             break;
                         }
 
@@ -129,8 +135,12 @@ internal static class WalRecovery
                         var key = span.Slice(off, klen).ToArray(); off += klen;
                         var val = span.Slice(off, vlen).ToArray();
 
-                        if (encryption is not null)
-                            val = encryption.Decrypt(val, table, key); // <- NOWE
+                        // Secondary-index PUTs intentionally carry an empty
+                        // value. Document ciphertext is never empty (it has a
+                        // version, nonce and tag), so this preserves encrypted
+                        // document recovery without trying to decrypt indexes.
+                        if (encryption is not null && val.Length > 0)
+                            val = encryption.Decrypt(val, table, key);
 
                         if (!pending.TryGetValue(txId, out var list))
                             list = pending[txId] = new List<Action>(8);
@@ -148,16 +158,18 @@ internal static class WalRecovery
                         {
                             truncateReason = $"DELETE frame too short ({span.Length} bytes) at offset {frameStart}";
                             truncateTail = true;
+                            issueMayBeTail = false;
                             break;
                         }
                         ulong txId = BinaryPrimitives.ReadUInt64LittleEndian(span.Slice(1, 8));
                         ushort tlen = BinaryPrimitives.ReadUInt16LittleEndian(span.Slice(9, 2));
                         int klen = BinaryPrimitives.ReadInt32LittleEndian(span.Slice(11, 4));
                         int off = 15;
-                        if (off + tlen + klen > span.Length)
+                        if (klen < 0 || (long)off + tlen + klen != span.Length)
                         {
                             truncateReason = $"DELETE frame payload truncated at offset {frameStart}";
                             truncateTail = true;
+                            issueMayBeTail = false;
                             break;
                         }
 
@@ -181,16 +193,18 @@ internal static class WalRecovery
                         {
                             truncateReason = $"DROP frame too short ({span.Length} bytes) at offset {frameStart}";
                             truncateTail = true;
+                            issueMayBeTail = false;
                             break;
                         }
 
                         ulong txId = BinaryPrimitives.ReadUInt64LittleEndian(span.Slice(1, 8));
                         ushort tlen = BinaryPrimitives.ReadUInt16LittleEndian(span.Slice(9, 2));
                         int off = 11;
-                        if (off + tlen > span.Length)
+                        if ((long)off + tlen != span.Length)
                         {
                             truncateReason = $"DROP frame payload truncated at offset {frameStart}";
                             truncateTail = true;
+                            issueMayBeTail = false;
                             break;
                         }
 
@@ -208,13 +222,21 @@ internal static class WalRecovery
                         {
                             truncateReason = $"COMMIT frame too short ({span.Length} bytes) at offset {frameStart}";
                             truncateTail = true;
+                            issueMayBeTail = false;
                             break;
                         }
                         ulong txId = BinaryPrimitives.ReadUInt64LittleEndian(span.Slice(1, 8));
-                        // opsCount = BinaryPrimitives.ReadInt32LittleEndian(span.Slice(9,4)); // nieużywane
+                        int opsCount = BinaryPrimitives.ReadInt32LittleEndian(span.Slice(9, 4));
 
                         if (pending.TryGetValue(txId, out var list))
                         {
+                            if (opsCount < 0 || list.Count != opsCount)
+                            {
+                                truncateReason = $"COMMIT operation count mismatch for transaction {txId}: declared={opsCount}, observed={list.Count}";
+                                truncateTail = true;
+                                issueMayBeTail = false;
+                                break;
+                            }
                             foreach (var act in list) act();
                             pending.Remove(txId);
                         }
@@ -225,6 +247,7 @@ internal static class WalRecovery
                     // nieznana ramka → bezpiecznie zatrzymać się
                     truncateReason = $"unknown WAL opcode 0x{op:X2} at offset {frameStart}";
                     truncateTail = true;
+                    issueMayBeTail = false;
                     fs.Position = fs.Length;
                     break;
             }
@@ -250,6 +273,9 @@ internal static class WalRecovery
 
         if (truncateTail)
         {
+            if (!issueMayBeTail)
+                throw new InvalidDataException($"WAL corruption is not confined to an incomplete tail: {truncateReason ?? "unknown reason"}. The WAL was left unchanged.");
+
             long before = fs.Length;
             if (lastGoodPosition < before)
             {
@@ -286,6 +312,46 @@ internal static class WalRecovery
 
     private static bool TryReadExactly(Stream s, byte[] dst)
         => TryReadExactly(s, dst.AsSpan());
+
+    private static bool ContainsValidFrameAfter(FileStream fs, long searchStart, Crc32 crc)
+    {
+        long original = fs.Position;
+        try
+        {
+            Span<byte> lenBytes = stackalloc byte[4];
+            Span<byte> crcBytes = stackalloc byte[4];
+            for (long candidate = searchStart; candidate + 9 <= fs.Length; candidate++)
+            {
+                fs.Position = candidate;
+                if (!TryReadExactly(fs, lenBytes)) return false;
+                uint length = BinaryPrimitives.ReadUInt32LittleEndian(lenBytes);
+                if (length == 0 || length > int.MaxValue || length > fs.Length - candidate - 8)
+                    continue;
+
+                int first = fs.ReadByte();
+                if (first != (int)Wal.WalOp.Begin &&
+                    first != (int)Wal.WalOp.Put &&
+                    first != (int)Wal.WalOp.Delete &&
+                    first != (int)Wal.WalOp.DropTable &&
+                    first != (int)Wal.WalOp.Commit)
+                    continue;
+
+                fs.Position = candidate + 4;
+                var payload = new byte[(int)length];
+                if (!TryReadExactly(fs, payload) || !TryReadExactly(fs, crcBytes))
+                    continue;
+
+                if (BinaryPrimitives.ReadUInt32LittleEndian(crcBytes) == crc.Compute(payload))
+                    return true;
+            }
+
+            return false;
+        }
+        finally
+        {
+            fs.Position = original;
+        }
+    }
 
     private static void DropRecoveredTable(ConcurrentDictionary<string, MemTable> tables, ISet<string> droppedTables, string canonicalName)
     {

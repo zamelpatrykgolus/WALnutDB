@@ -12,7 +12,7 @@ public sealed class AesGcmEncryption : IEncryption, IDisposable
     private readonly RandomNumberGenerator _rng = RandomNumberGenerator.Create();
 
     public AesGcmEncryption(ReadOnlySpan<byte> key256)
-        => _aes = new AesGcm(key256.ToArray()); // 16/24/32B – zalecam 32B
+        => _aes = new AesGcm(key256.ToArray(), tagSizeInBytes: 16); // 16/24/32B – zalecam 32B
 
     public byte[] Encrypt(ReadOnlySpan<byte> plaintext, string table, ReadOnlySpan<byte> pk)
     {

@@ -19,10 +19,14 @@ namespace WalnutDb.Sst
             Path = path ?? throw new ArgumentNullException(nameof(path));
 
             using var fs = OpenRead();
+            if (fs.Length < Header.Length + 4)
+                throw new InvalidDataException("SST file is shorter than its header and trailer.");
             var hdr = new byte[Header.Length];
 
             if (fs.Read(hdr, 0, hdr.Length) != hdr.Length || !hdr.AsSpan().SequenceEqual(Header))
                 throw new InvalidDataException("Invalid SST header.");
+
+            ValidateLayout(fs);
 
             // spróbuj wczytać .sxi
             try
@@ -30,6 +34,8 @@ namespace WalnutDb.Sst
                 var idx = SstIndex.TryLoad(path + ".sxi");
                 if (idx is not null)
                 {
+                    if (idx.Value.Offsets.Any(offset => offset < Header.Length || offset >= fs.Length - 4))
+                        throw new InvalidDataException("SST sidecar contains an offset outside the data file.");
                     _idxKeys = idx.Value.Keys;
                     _idxOffsets = idx.Value.Offsets;
                 }
@@ -54,20 +60,25 @@ namespace WalnutDb.Sst
 
             while (fs.Position < endPos)
             {
+                if (endPos - fs.Position < 8)
+                    throw new InvalidDataException($"Truncated SST record header at offset {fs.Position}.");
                 if (fs.Read(len, 0, 8) != 8) 
-                    return false;
+                    throw new InvalidDataException("Truncated SST record header.");
 
                 uint klen = BinaryPrimitives.ReadUInt32LittleEndian(len.AsSpan(0, 4));
                 uint vlen = BinaryPrimitives.ReadUInt32LittleEndian(len.AsSpan(4, 4));
 
-                if (klen > int.MaxValue || vlen > int.MaxValue) 
-                    return false;
+                if (klen > int.MaxValue || vlen > int.MaxValue ||
+                    (long)klen + vlen > endPos - fs.Position)
+                    throw new InvalidDataException($"Invalid SST record length at offset {fs.Position - 8}.");
 
                 var kbuf = new byte[(int)klen];
                 var vbuf = new byte[(int)vlen];
 
-                if (fs.Read(kbuf, 0, kbuf.Length) != kbuf.Length) return false;
-                if (fs.Read(vbuf, 0, vbuf.Length) != vbuf.Length) return false;
+                if (fs.Read(kbuf, 0, kbuf.Length) != kbuf.Length)
+                    throw new InvalidDataException("Truncated SST key.");
+                if (fs.Read(vbuf, 0, vbuf.Length) != vbuf.Length)
+                    throw new InvalidDataException("Truncated SST value.");
 
                 int cmp = ByteCompare(kbuf, key);
                 if (cmp == 0)
@@ -109,23 +120,26 @@ namespace WalnutDb.Sst
 
             while (fs.Position < endPos)
             {
+                if (endPos - fs.Position < 8)
+                    throw new InvalidDataException($"Truncated SST record header at offset {fs.Position}.");
                 if (fs.Read(len, 0, 8) != 8) 
-                    yield break;
+                    throw new InvalidDataException("Truncated SST record header.");
 
                 uint klen = BinaryPrimitives.ReadUInt32LittleEndian(len.AsSpan(0, 4));
                 uint vlen = BinaryPrimitives.ReadUInt32LittleEndian(len.AsSpan(4, 4));
 
-                if (klen > int.MaxValue || vlen > int.MaxValue) 
-                    yield break;
+                if (klen > int.MaxValue || vlen > int.MaxValue ||
+                    (long)klen + vlen > endPos - fs.Position)
+                    throw new InvalidDataException($"Invalid SST record length at offset {fs.Position - 8}.");
 
                 var kbuf = new byte[(int)klen];
                 var vbuf = new byte[(int)vlen];
 
-                if (fs.Read(kbuf, 0, kbuf.Length) != kbuf.Length) 
-                    yield break;
+                if (fs.Read(kbuf, 0, kbuf.Length) != kbuf.Length)
+                    throw new InvalidDataException("Truncated SST key.");
 
-                if (fs.Read(vbuf, 0, vbuf.Length) != vbuf.Length) 
-                    yield break;
+                if (fs.Read(vbuf, 0, vbuf.Length) != vbuf.Length)
+                    throw new InvalidDataException("Truncated SST value.");
 
                 if (!inRange)
                     inRange = ByteCompare(kbuf, from) >= 0;
@@ -147,6 +161,40 @@ namespace WalnutDb.Sst
             Share = FileShare.ReadWrite | FileShare.Delete,
             Options = FileOptions.SequentialScan
         });
+
+        private static void ValidateLayout(FileStream fs)
+        {
+            long endPos = fs.Length - 4;
+            fs.Position = Header.Length;
+            Span<byte> lengths = stackalloc byte[8];
+            uint actualCount = 0;
+
+            while (fs.Position < endPos)
+            {
+                long recordOffset = fs.Position;
+                if (endPos - recordOffset < 8 || fs.Read(lengths) != 8)
+                    throw new InvalidDataException($"Truncated SST record header at offset {recordOffset}.");
+
+                uint keyLength = BinaryPrimitives.ReadUInt32LittleEndian(lengths[..4]);
+                uint valueLength = BinaryPrimitives.ReadUInt32LittleEndian(lengths[4..]);
+                long payloadLength = (long)keyLength + valueLength;
+                if (keyLength > int.MaxValue || valueLength > int.MaxValue || payloadLength > endPos - fs.Position)
+                    throw new InvalidDataException($"Invalid SST record length at offset {recordOffset}.");
+
+                fs.Position += payloadLength;
+                actualCount++;
+            }
+
+            if (fs.Position != endPos)
+                throw new InvalidDataException("SST records do not end at the trailer boundary.");
+
+            Span<byte> trailer = stackalloc byte[4];
+            if (fs.Read(trailer) != 4)
+                throw new InvalidDataException("Truncated SST trailer.");
+            uint declaredCount = BinaryPrimitives.ReadUInt32LittleEndian(trailer);
+            if (actualCount != declaredCount)
+                throw new InvalidDataException($"SST record count mismatch: declared={declaredCount}, observed={actualCount}.");
+        }
 
         private static int ByteCompare(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b)
         {

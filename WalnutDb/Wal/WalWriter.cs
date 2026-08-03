@@ -24,6 +24,8 @@ public sealed class WalWriter : IWalWriter
     private readonly Crc32 _crc = new();
     private readonly SemaphoreSlim _ioGate = new(1, 1); // serializacja operacji
     private int _disposeOnce;
+    private int _faulted;
+    private Exception? _faultException;
     private readonly string _path;
     public string Path => _path;
 
@@ -38,7 +40,7 @@ public sealed class WalWriter : IWalWriter
             Mode = FileMode.OpenOrCreate,
             Access = FileAccess.ReadWrite,
             Share = FileShare.ReadWrite, // pozwól recovery otworzyć uchwyt RW (truncate)
-            Options = FileOptions.Asynchronous | FileOptions.SequentialScan | FileOptions.WriteThrough
+            Options = FileOptions.Asynchronous | FileOptions.SequentialScan
         });
         _fs.Seek(0, SeekOrigin.End);
         _loop = Task.Run(WriterLoopAsync);
@@ -46,17 +48,17 @@ public sealed class WalWriter : IWalWriter
 
     public async ValueTask TruncateAsync(CancellationToken ct = default)
     {
+        // Queue barrier: all transactions accepted before truncate must reach
+        // the stream before we take the physical I/O lock.
+        await FlushAsync(ct).ConfigureAwait(false);
         await _ioGate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            // dopilnuj flushu bieżących batchy
-            await FlushAsync(ct).ConfigureAwait(false);
-
             // wyzeruj plik
+            _fs.Flush(true);
             _fs.Position = 0;
             _fs.SetLength(0);
-
-            await _fs.FlushAsync(ct).ConfigureAwait(false);
+            _fs.Flush(true);
         }
         catch (Exception ex)
         {
@@ -71,6 +73,8 @@ public sealed class WalWriter : IWalWriter
 
     public async ValueTask<CommitHandle> AppendTransactionAsync(IReadOnlyList<ReadOnlyMemory<byte>> frames, Durability durability, CancellationToken ct = default)
     {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposeOnce) != 0, this);
+        ThrowIfFaulted();
         if (frames.Count == 0) 
             throw new ArgumentException("empty frames");
 
@@ -98,26 +102,43 @@ public sealed class WalWriter : IWalWriter
                 while (pending.Count < _maxBatch && sw.Elapsed < _groupWindow && reader.TryRead(out var item))
                     pending.Add(item);
 
-                // Always append at the current physical end of the file. Recovery may have
-                // truncated the underlying stream, so reset the position to Length before
-                // emitting the next batch to avoid leaving zero-filled gaps that would break
-                // subsequent replays.
-                if (_fs.Position != _fs.Length)
-                    _fs.Seek(0, SeekOrigin.End);
+                await _ioGate.WaitAsync(_cts.Token).ConfigureAwait(false);
+                try
+                {
+                    // Always append at the current physical end of the file. Recovery may have
+                    // truncated the underlying stream, so reset the position to Length before
+                    // emitting the next batch to avoid leaving zero-filled gaps that would break
+                    // subsequent replays.
+                    if (_fs.Position != _fs.Length)
+                        _fs.Seek(0, SeekOrigin.End);
 
-                foreach (var item in pending)
-                    foreach (var frame in item.Frames)
-                        await WriteFrameAsync(frame, _cts.Token).ConfigureAwait(false);
+                    foreach (var item in pending)
+                        foreach (var frame in item.Frames)
+                            await WriteFrameAsync(frame, _cts.Token).ConfigureAwait(false);
 
-                _fs.Flush(true);
+                    // Safe/Group commits and explicit barriers request durable
+                    // media flush. Fast-only batches remain in OS buffers until
+                    // a later durable operation or orderly disposal.
+                    if (pending.Any(item => item.Durability != Durability.Fast))
+                        _fs.Flush(true);
+                    else
+                        await _fs.FlushAsync(_cts.Token).ConfigureAwait(false);
 
-                foreach (var item in pending)
-                    item.Promise.TrySetResult(true);
+                    foreach (var item in pending)
+                        item.Promise.TrySetResult(true);
+                }
+                finally
+                {
+                    _ioGate.Release();
+                }
             }
         }
         catch (OperationCanceledException) { /* normal shutdown */ }
         catch (Exception ex)
         {
+            Volatile.Write(ref _faulted, 1);
+            _faultException = ex;
+            _queue.Writer.TryComplete(ex);
             WalnutLogger.Exception(ex);
 
             foreach (var item in pending)
@@ -156,10 +177,26 @@ public sealed class WalWriter : IWalWriter
         WriteU32Le(_fs, crc);                          // crc
     }
 
-    public ValueTask FlushAsync(CancellationToken ct = default)
+    public async ValueTask FlushAsync(CancellationToken ct = default)
     {
-        _fs.Flush(true); // trwały flush
-        return ValueTask.CompletedTask;
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposeOnce) != 0, this);
+        ThrowIfFaulted();
+
+        // An empty item is a queue barrier. WriterLoop completes it only after
+        // every preceding item has been written and Flush(true) has succeeded.
+        var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var barrier = new WalItem(Array.Empty<ReadOnlyMemory<byte>>(), Durability.Safe, tcs);
+        if (!_queue.Writer.TryWrite(barrier))
+            await _queue.Writer.WriteAsync(barrier, ct).ConfigureAwait(false);
+
+        await tcs.Task.WaitAsync(ct).ConfigureAwait(false);
+        ThrowIfFaulted();
+    }
+
+    private void ThrowIfFaulted()
+    {
+        if (Volatile.Read(ref _faulted) != 0)
+            throw new IOException("The WAL writer is faulted.", _faultException);
     }
 
     public async ValueTask DisposeAsync()
@@ -170,10 +207,7 @@ public sealed class WalWriter : IWalWriter
         // Zakończ przyjmowanie zadań
         try { _queue.Writer.TryComplete(); } catch { /* ignore */ }
 
-        // Przerwij pętlę
-        try { _cts.Cancel(); } catch (ObjectDisposedException) { /* already disposed elsewhere */ }
-
-        // Poczekaj aż pętla się zakończy
+        // Poczekaj aż pętla opróżni kolejkę i zakończy się po TryComplete().
         try { await _loop.ConfigureAwait(false); } catch { /* ignore */ }
 
         // (Opcjonalnie) oznacz wszystkie niedoszłe promise jako faulted,
@@ -191,6 +225,7 @@ public sealed class WalWriter : IWalWriter
 
         // Na końcu sprzątnij CTS
         try { _cts.Dispose(); } catch { /* ignore */ }
+        try { _ioGate.Dispose(); } catch { /* ignore */ }
 
     }
 }

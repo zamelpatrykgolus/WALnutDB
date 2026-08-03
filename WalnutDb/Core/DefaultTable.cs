@@ -93,6 +93,7 @@ internal sealed class DefaultTable<T> : ITable<T>
 
     private void RebuildIndexesWithoutSnapshot(List<IndexDef> indexesToRebuild)
     {
+        using var maintenanceLease = _db.MaintenanceGate.EnterWriteAsync().AsTask().GetAwaiter().GetResult();
         WalnutLogger.Warning($"Detected missing index storage for table '{_name}'. Rebuilding {indexesToRebuild.Count} index entr{(indexesToRebuild.Count == 1 ? "y" : "ies")} without creating a full table snapshot.");
 
         _db.WriterLock.Wait();
@@ -236,6 +237,8 @@ internal sealed class DefaultTable<T> : ITable<T>
 
         if (txHandle is not WalnutTransaction tx)
             throw new InvalidOperationException("Unknown transaction type.");
+        if (!tx.BelongsTo(_db))
+            throw new InvalidOperationException("The transaction belongs to a different database instance.");
 
         var key = _map.GetKeyBytes(item);
         var val = _map.Serialize(item);                         // plaintext → MEM
@@ -246,7 +249,15 @@ internal sealed class DefaultTable<T> : ITable<T>
         bool hasOld = false;
         T old = default!;
 
-        if (_memRef.Current.TryGet(key, out var rawOld) && rawOld is not null)
+        if (tx.TryGetPendingValue(_name, key, out var pendingOld))
+        {
+            if (pendingOld is not null)
+            {
+                old = _map.Deserialize(pendingOld);
+                hasOld = true;
+            }
+        }
+        else if (_memRef.Current.TryGet(key, out var rawOld) && rawOld is not null)
         {
             old = _map.Deserialize(rawOld);
             hasOld = true;
@@ -356,6 +367,7 @@ internal sealed class DefaultTable<T> : ITable<T>
 
         // 3) Główny PUT
         tx.AddPut(_name, key, walVal);
+        tx.SetPendingValue(_name, key, val);
         tx.AddApply(() => _memRef.Current.Upsert(key, val));
 
         // 4) Aktualizacja indeksów (+ zwalnianie rezerwacji STAREJ wartości, jeśli zmieniona)
@@ -364,7 +376,23 @@ internal sealed class DefaultTable<T> : ITable<T>
             var newValObj = idx.Extract(item);
 
             if (newValObj is null)
+            {
+                if (hasOld)
+                {
+                    var oldValObj = idx.Extract(old);
+                    if (oldValObj is not null)
+                    {
+                        var oldPrefix = IndexKeyCodec.Encode(oldValObj, idx.DecimalScale);
+                        var oldIdxKey = IndexKeyCodec.ComposeIndexEntryKey(oldPrefix, key);
+                        tx.AddDelete(idx.IndexTableName, oldIdxKey);
+                        tx.AddApply(() => idx.Mem.Current.Delete(oldIdxKey));
+
+                        var capturedIdx = idx.IndexTableName;
+                        tx.AddApply(() => _db.ReleaseUnique(capturedIdx, oldPrefix, key));
+                    }
+                }
                 continue;
+            }
 
             var newPrefix = IndexKeyCodec.Encode(newValObj, idx.DecimalScale);
             var newIdxKey = IndexKeyCodec.ComposeIndexEntryKey(newPrefix, key);
@@ -372,20 +400,23 @@ internal sealed class DefaultTable<T> : ITable<T>
             if (hasOld)
             {
                 var oldValObj = idx.Extract(old);
-                var oldPrefix = IndexKeyCodec.Encode(oldValObj, idx.DecimalScale);
-
-                if (!ByteArrayEquals(oldPrefix, newPrefix))
+                if (oldValObj is not null)
                 {
-                    var oldIdxKey = IndexKeyCodec.ComposeIndexEntryKey(oldPrefix, key);
+                    var oldPrefix = IndexKeyCodec.Encode(oldValObj, idx.DecimalScale);
 
-                    // tombstone starego wpisu indeksu (ważne, gdy „stary” rekord był tylko w SST!)
-                    tx.AddDelete(idx.IndexTableName, oldIdxKey);
-                    tx.AddApply(() => idx.Mem.Current.Delete(oldIdxKey));
+                    if (!ByteArrayEquals(oldPrefix, newPrefix))
+                    {
+                        var oldIdxKey = IndexKeyCodec.ComposeIndexEntryKey(oldPrefix, key);
 
-                    // zwolnij rezerwację STAREJ wartości po zastosowaniu tombstona
-                    var capturedIdx = idx.IndexTableName;
-                    var capturedOld = oldPrefix;
-                    tx.AddApply(() => _db.ReleaseUnique(capturedIdx, capturedOld, key));
+                        // tombstone starego wpisu indeksu (ważne, gdy „stary” rekord był tylko w SST!)
+                        tx.AddDelete(idx.IndexTableName, oldIdxKey);
+                        tx.AddApply(() => idx.Mem.Current.Delete(oldIdxKey));
+
+                        // zwolnij rezerwację STAREJ wartości po zastosowaniu tombstona
+                        var capturedIdx = idx.IndexTableName;
+                        var capturedOld = oldPrefix;
+                        tx.AddApply(() => _db.ReleaseUnique(capturedIdx, capturedOld, key));
+                    }
                 }
             }
 
@@ -447,6 +478,8 @@ internal sealed class DefaultTable<T> : ITable<T>
 
         if (txHandle is not WalnutTransaction tx)
             throw new InvalidOperationException("Unknown transaction type.");
+        if (!tx.BelongsTo(_db))
+            throw new InvalidOperationException("The transaction belongs to a different database instance.");
 
         var key = _map.EncodeIdToBytes(id);
 
@@ -454,7 +487,15 @@ internal sealed class DefaultTable<T> : ITable<T>
         T old = default!;
         Diag.U($"DEL apply    table={_name} key={Diag.B64(key)}");
 
-        if (_memRef.Current.TryGet(key, out var rawOld) && rawOld is not null)
+        if (tx.TryGetPendingValue(_name, key, out var pendingOld))
+        {
+            if (pendingOld is not null)
+            {
+                old = _map.Deserialize(pendingOld);
+                hasOld = true;
+            }
+        }
+        else if (_memRef.Current.TryGet(key, out var rawOld) && rawOld is not null)
         {
             old = _map.Deserialize(rawOld);
             hasOld = true;
@@ -468,6 +509,7 @@ internal sealed class DefaultTable<T> : ITable<T>
         }
 
         tx.AddDelete(_name, key);
+        tx.SetPendingValue(_name, key, null);
         tx.AddApply(() =>
         {
             _memRef.Current.Delete(key);
@@ -513,6 +555,8 @@ internal sealed class DefaultTable<T> : ITable<T>
 
         if (txHandle is not WalnutTransaction tx)
             throw new InvalidOperationException("Unknown transaction type.");
+        if (!tx.BelongsTo(_db))
+            throw new InvalidOperationException("The transaction belongs to a different database instance.");
 
         var key = _map.GetKeyBytes(item);
 
@@ -520,7 +564,15 @@ internal sealed class DefaultTable<T> : ITable<T>
         T old = default!;
         Diag.U($"DEL apply    table={_name} key={Diag.B64(key)}");
 
-        if (_memRef.Current.TryGet(key, out var rawOld) && rawOld is not null)
+        if (tx.TryGetPendingValue(_name, key, out var pendingOld))
+        {
+            if (pendingOld is not null)
+            {
+                old = _map.Deserialize(pendingOld);
+                hasOld = true;
+            }
+        }
+        else if (_memRef.Current.TryGet(key, out var rawOld) && rawOld is not null)
         {
             old = _map.Deserialize(rawOld);
             hasOld = true;
@@ -534,6 +586,7 @@ internal sealed class DefaultTable<T> : ITable<T>
         }
 
         tx.AddDelete(_name, key);
+        tx.SetPendingValue(_name, key, null);
         tx.AddApply(() =>
         {
             _memRef.Current.Delete(key);

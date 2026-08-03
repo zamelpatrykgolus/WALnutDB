@@ -9,6 +9,11 @@ namespace WalnutDb.Sst
         public static async ValueTask WriteAsync(string path, IAsyncEnumerable<(byte[] Key, byte[] Val)> sorted, CancellationToken ct = default)
         {
             Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            var idxPath = path + ".sxi";
+            // Never allow a sidecar left by an interrupted older attempt to be
+            // promoted for newly written SST contents.
+            if (File.Exists(idxPath))
+                File.Delete(idxPath);
             using var fs = new FileStream(path, new FileStreamOptions
             {
                 Mode = FileMode.Create,
@@ -51,17 +56,17 @@ namespace WalnutDb.Sst
             var trailer = new byte[4];
             WriteUInt32LE(trailer, 0, count);
             await fs.WriteAsync(trailer, 0, 4, ct).ConfigureAwait(false);
-            await fs.FlushAsync(ct).ConfigureAwait(false);
+            fs.Flush(true);
 
             // —— zapisz indeks poboczny (best-effort) ——
             try
             {
-                var idxPath = path + ".sxi";
                 await SstIndex.WriteAsync(idxPath, idx, ct).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
                 WalnutLogger.Exception(ex);
+                try { if (File.Exists(idxPath)) File.Delete(idxPath); } catch { /* optional sidecar */ }
                 // indeks jest opcjonalny; w razie błędu po prostu go pomijamy
             }
         }

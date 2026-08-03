@@ -35,7 +35,7 @@ namespace WalnutDb.Sst
                 await fs.WriteAsync(i64, ct).ConfigureAwait(false);
             }
 
-            await fs.FlushAsync(ct).ConfigureAwait(false);
+            fs.Flush(true);
         }
 
         internal static (byte[][] Keys, long[] Offsets)? TryLoad(string indexPath)
@@ -53,24 +53,28 @@ namespace WalnutDb.Sst
             Span<byte> u32 = stackalloc byte[4];
             if (fs.Read(u32) != 4) return null;
             uint count = BinaryPrimitives.ReadUInt32LittleEndian(u32);
+            if (count > int.MaxValue || count > (fs.Length - 4) / 12)
+                return null;
 
-            var keys = new byte[count][];
-            var offs = new long[count];
+            var keys = new byte[(int)count][];
+            var offs = new long[(int)count];
+            Span<byte> i64 = stackalloc byte[8];
 
             for (uint i = 0; i < count; i++)
             {
                 if (fs.Read(u32) != 4) return null;
                 uint klen = BinaryPrimitives.ReadUInt32LittleEndian(u32);
+                if (klen > int.MaxValue || klen > fs.Length - fs.Position - 8)
+                    return null;
 
-                var k = new byte[klen];
+                var k = new byte[(int)klen];
                 if (fs.Read(k, 0, (int)klen) != (int)klen) return null;
 
-                Span<byte> i64 = stackalloc byte[8];
                 if (fs.Read(i64) != 8) return null;
                 long off = BinaryPrimitives.ReadInt64LittleEndian(i64);
 
-                keys[i] = k;
-                offs[i] = off;
+                keys[(int)i] = k;
+                offs[(int)i] = off;
             }
 
             return (keys, offs);

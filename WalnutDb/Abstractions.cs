@@ -11,7 +11,9 @@ namespace WalnutDb;
 public enum Durability { Safe, Group, Fast }
 
 /// <summary>
-/// Tryb defragmentacji: Compact (łączenie segmentów) lub RebuildSwap (pełne zbudowanie nowego zestawu plików i atomowa podmiana).
+/// Tryb defragmentacji. W formacie SSTv1 oba tryby korzystają z bezpiecznej
+/// przebudowy pojedynczego segmentu na tabelę; wartości pozostają rozdzielone,
+/// aby zachować zgodność API z przyszłymi formatami wielosegmentowymi.
 /// </summary>
 public enum DefragMode { Compact, RebuildSwap }
 
@@ -37,6 +39,13 @@ public sealed class DatabaseOptions
 
     /// <summary>Przy Dispose() wykonać Checkpoint (flush memtable→SST + rotacja WAL)?</summary>
     public bool CheckpointOnDispose { get; init; } = true;
+
+    /// <summary>
+    /// Opcjonalne rozstrzygnięcie niejednoznacznych nazw w bazach sprzed manifestu.
+    /// Kluczem jest nazwa pliku SST bez rozszerzenia, wartością logiczna nazwa tabeli.
+    /// Migracja pozostaje metadana-only i nie zmienia wskazanego SST.
+    /// </summary>
+    public IReadOnlyDictionary<string, string>? LegacyTableNameMappings { get; init; }
 }
 
 /// <summary>

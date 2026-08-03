@@ -33,10 +33,10 @@ public sealed class StorageDiagnosticsTests
 
         await using (var db = new WalnutDatabase(dir, new DatabaseOptions(), new FileSystemManifestStore(dir), new WalWriter(walPath)))
         {
-            var table = await db.OpenTableAsync(new TableOptions<HealDoc> { GetId = d => d.Id }).ConfigureAwait(false);
-            await table.UpsertAsync(new HealDoc { Id = "a", Payload = "one" }).ConfigureAwait(false);
-            await table.UpsertAsync(new HealDoc { Id = "b", Payload = "two" }).ConfigureAwait(false);
-            await db.CheckpointAsync().ConfigureAwait(false);
+            var table = await db.OpenTableAsync(new TableOptions<HealDoc> { GetId = d => d.Id });
+            await table.UpsertAsync(new HealDoc { Id = "a", Payload = "one" });
+            await table.UpsertAsync(new HealDoc { Id = "b", Payload = "two" });
+            await db.CheckpointAsync();
         }
 
         var sstDir = Path.Combine(dir, "sst");
@@ -59,10 +59,10 @@ public sealed class StorageDiagnosticsTests
         string sstPath;
         await using (var db = new WalnutDatabase(dir, new DatabaseOptions(), new FileSystemManifestStore(dir), new WalWriter(walPath)))
         {
-            var table = await db.OpenTableAsync(new TableOptions<HealDoc> { GetId = d => d.Id }).ConfigureAwait(false);
+            var table = await db.OpenTableAsync(new TableOptions<HealDoc> { GetId = d => d.Id });
             for (int i = 0; i < 8; i++)
-                await table.UpsertAsync(new HealDoc { Id = $"row-{i}", Payload = new string('x', i + 1) }).ConfigureAwait(false);
-            await db.CheckpointAsync().ConfigureAwait(false);
+                await table.UpsertAsync(new HealDoc { Id = $"row-{i}", Payload = new string('x', i + 1) });
+            await db.CheckpointAsync();
             sstPath = Directory.GetFiles(Path.Combine(dir, "sst"), "*.sst").Single();
         }
 

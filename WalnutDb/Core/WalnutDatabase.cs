@@ -8,6 +8,7 @@ using System.Threading;
 
 using WalnutDb.Indexing;
 using WalnutDb.Sst;
+using WalnutDb.Storage;
 using WalnutDb.Wal;
 
 namespace WalnutDb.Core;
@@ -24,10 +25,16 @@ public sealed class WalnutDatabase : IDatabase
     internal IEncryption? Encryption => _options.Encryption;
     private readonly ConcurrentDictionary<string, SstReader> _sst = new();
     internal readonly SemaphoreSlim WriterLock = new(1, 1);
+    internal readonly AsyncReadWriteGate MaintenanceGate = new();
+    private readonly FileStream _databaseLock;
     private readonly ConcurrentDictionary<string, MemTableRef> _tables = new();
     internal readonly ConcurrentDictionary<string, TableMetrics> _metrics = new();
     private readonly ConcurrentDictionary<string, byte[]> _uniqueGuards = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, bool> _indexUnique = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, string> _tableFiles = new(StringComparer.Ordinal);
+    private StorageCatalog _catalog = new();
+    private int _disposeOnce;
+    internal bool IsDisposing => Volatile.Read(ref _disposeOnce) != 0;
 
     internal void RegisterIndex(string indexTableName, bool unique)
     => _indexUnique[CanonicalizeName(indexTableName)] = unique;
@@ -44,6 +51,24 @@ public sealed class WalnutDatabase : IDatabase
         _typeNames = typeResolver ?? new DefaultTypeNameResolver(options);
         Directory.CreateDirectory(_dir);
 
+        // A WalnutDb directory has a single writer. Without this lock, two
+        // FileStreams can overwrite/interleave frames in the shared WAL.
+        var lockPath = Path.Combine(_dir, ".walnutdb.lock");
+        try
+        {
+        var incompleteBackupMarker = Path.Combine(_dir, ".walnutdb-backup-incomplete");
+        if (File.Exists(incompleteBackupMarker))
+            throw new InvalidDataException("The database directory contains an incomplete-backup marker and must not be opened as a valid backup.");
+            _databaseLock = new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+        }
+        catch (IOException ex)
+        {
+            try { Wal.DisposeAsync().AsTask().GetAwaiter().GetResult(); } catch { /* preserve lock error */ }
+            throw new IOException($"Database '{Path.GetFullPath(_dir)}' is already open by another process or WalnutDatabase instance.", ex);
+        }
+
+        try
+        {
         // ⬇⬇⬇ NOWE: ustal właściwą ścieżkę WAL
         string walPath = (wal is WalWriter ww && !string.IsNullOrWhiteSpace(ww.Path))
             ? ww.Path
@@ -54,15 +79,12 @@ public sealed class WalnutDatabase : IDatabase
 
         if (File.Exists(walPath))
         {
-            try
-            {
-                WalRecovery.Replay(walPath, recovered, droppedTables, _options.Encryption);
-                AdoptRecoveredTables(recovered);
-            }
-            catch (Exception ex)
-            {
-                WalnutLogger.Exception(ex);
-            }
+            // Tail damage is repaired by WalRecovery itself. Any other error
+            // (wrong encryption key, malformed committed frame, I/O failure)
+            // must stop opening the database; continuing would expose a
+            // silently incomplete view.
+            WalRecovery.Replay(walPath, recovered, droppedTables, _options.Encryption);
+            AdoptRecoveredTables(recovered);
         }
 
         _sstDir = Path.Combine(_dir, "sst");
@@ -71,23 +93,92 @@ public sealed class WalnutDatabase : IDatabase
         if (droppedTables.Count > 0)
             PurgeDroppedArtifacts(droppedTables);
 
-        MigrateSstFilenames();
-
-        foreach (var file in Directory.EnumerateFiles(_sstDir, "*.sst"))
+        StorageCatalog? loadedCatalog;
+        try
         {
-            var baseName = Path.GetFileNameWithoutExtension(file);
-            var logicalName = DecodeNameFromFile(baseName);
-            var canonical = CanonicalizeName(logicalName);
-            try
+            loadedCatalog = StorageCatalogStore.Load(_dir, _manifest);
+        }
+        catch (UnsupportedStorageVersionException)
+        {
+            _databaseLock.Dispose();
+            throw;
+        }
+        catch (InvalidDataException ex)
+        {
+            // The manifest is only metadata for storage v1. Valid WAL/SST files
+            // can reconstruct it without copying the data set.
+            WalnutLogger.Warning($"Ignoring damaged v1 manifest and rebuilding its table mapping: {ex.Message}");
+            loadedCatalog = null;
+        }
+        if (loadedCatalog is not null)
+        {
+            _catalog = loadedCatalog;
+            _nextSeqNo = Math.Max(_nextSeqNo, loadedCatalog.LastSequence + 1);
+            foreach (var mapping in loadedCatalog.TableFiles)
             {
-                _sst[canonical] = new SstReader(file);
-            }
-            catch (Exception ex)
-            {
-                WalnutLogger.Exception(ex);
-                /* ignore */
+                var canonical = CanonicalizeName(mapping.Key);
+                if (droppedTables.Contains(canonical) ||
+                    droppedTables.Any(t => canonical.StartsWith($"__index__{t}__", StringComparison.Ordinal)))
+                    continue;
+
+                var fileName = mapping.Value;
+                if (!string.Equals(Path.GetFileName(fileName), fileName, StringComparison.Ordinal) ||
+                    !fileName.EndsWith(".sst", StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidDataException($"Manifest contains invalid SST file name '{fileName}'.");
+
+                var file = Path.Combine(_sstDir, fileName);
+                if (!File.Exists(file))
+                {
+                    WalnutLogger.Warning($"Manifest references missing SST file '{fileName}' for table '{canonical}'. Removing the stale mapping so legacy self-healing can run.");
+                    continue;
+                }
+
+                LoadSst(canonical, file);
             }
         }
+
+        // Legacy migration is metadata-only. Existing SST files stay in place;
+        // their discovered mapping is persisted in the small v1 manifest.
+        var knownFiles = new HashSet<string>(_tableFiles.Values, StringComparer.OrdinalIgnoreCase);
+        if (loadedCatalog is null)
+        {
+            foreach (var file in Directory.EnumerateFiles(_sstDir, "*.sst"))
+            {
+                var fileName = Path.GetFileName(file);
+                if (knownFiles.Contains(fileName))
+                    continue;
+
+                var baseName = Path.GetFileNameWithoutExtension(file);
+                string logicalName;
+                if (_options.LegacyTableNameMappings?.TryGetValue(baseName, out var configuredName) == true)
+                {
+                    logicalName = configuredName;
+                }
+                else
+                {
+                    logicalName = recovered.ContainsKey(baseName) ? baseName : DecodeNameFromFile(baseName);
+                    if (!string.Equals(logicalName, baseName, StringComparison.Ordinal))
+                        WalnutLogger.Warning($"Legacy SST name '{baseName}' is ambiguous and was interpreted as table '{logicalName}'. Configure DatabaseOptions.LegacyTableNameMappings to override this without rewriting the SST.");
+                }
+                var canonical = CanonicalizeName(logicalName);
+                if (_sst.ContainsKey(canonical))
+                    throw new InvalidDataException($"Multiple SST files resolve to table '{canonical}'. Manual repair is required.");
+
+                LoadSst(canonical, file);
+                knownFiles.Add(fileName);
+            }
+        }
+        else
+        {
+            foreach (var file in Directory.EnumerateFiles(_sstDir, "*.sst"))
+            {
+                var fileName = Path.GetFileName(file);
+                if (!knownFiles.Contains(fileName))
+                    WalnutLogger.Warning($"Ignoring orphaned SST file '{fileName}' because it is not referenced by the valid manifest.");
+            }
+        }
+
+        PersistCatalogAsync(CancellationToken.None).AsTask().GetAwaiter().GetResult();
 
         var legacyDangling = new List<(string IndexTable, byte[] Key)>();
         var legacySeen = new HashSet<string>(StringComparer.Ordinal);
@@ -164,6 +255,16 @@ public sealed class WalnutDatabase : IDatabase
             {
                 WalnutLogger.Exception(ex);
             }
+        }
+        }
+        catch
+        {
+            foreach (var reader in _sst.Values)
+                try { reader.Dispose(); } catch { }
+            _sst.Clear();
+            try { _databaseLock.Dispose(); } catch { }
+            try { Wal.DisposeAsync().AsTask().GetAwaiter().GetResult(); } catch { }
+            throw;
         }
     }
 
@@ -325,12 +426,12 @@ public sealed class WalnutDatabase : IDatabase
             try { removed.Dispose(); } catch { }
         }
 
-        var safe = EncodeNameToFile(indexTableName);
-        var sstPath = Path.Combine(_sstDir, safe + ".sst");
+        var sstPath = GetSstPath(indexTableName);
         try { if (File.Exists(sstPath)) File.Delete(sstPath); } catch { }
 
         var sxiPath = sstPath + ".sxi";
         try { if (File.Exists(sxiPath)) File.Delete(sxiPath); } catch { }
+        _tableFiles.TryRemove(indexTableName, out _);
     }
 
 
@@ -427,11 +528,28 @@ public sealed class WalnutDatabase : IDatabase
         return code == ERROR_SHARING_VIOLATION || code == ERROR_LOCK_VIOLATION;
     }
 
-    private static string? TryExtractBaseTableName(string indexTableName)
+    private string? TryExtractBaseTableName(string indexTableName)
     {
         const string prefix = "__index__";
         if (!indexTableName.StartsWith(prefix, StringComparison.Ordinal))
             return null;
+
+        // Prefer the longest known table name. This keeps indexes of tables
+        // such as "plant__devices" associated with the correct owner.
+        string? best = null;
+        foreach (var candidate in _tables.Keys.Concat(_sst.Keys))
+        {
+            if (candidate.StartsWith(prefix, StringComparison.Ordinal))
+                continue;
+
+            var expectedPrefix = prefix + candidate + "__";
+            if (indexTableName.StartsWith(expectedPrefix, StringComparison.Ordinal) &&
+                (best is null || candidate.Length > best.Length))
+                best = candidate;
+        }
+
+        if (best is not null)
+            return best;
 
         var rest = indexTableName.Substring(prefix.Length);
         var sep = rest.IndexOf("__", StringComparison.Ordinal);
@@ -517,8 +635,7 @@ public sealed class WalnutDatabase : IDatabase
             return false;
         }
 
-        var safe = EncodeNameToFile(indexTableName);
-        var candidate = Path.Combine(_sstDir, safe + ".sst");
+        var candidate = GetSstPath(indexTableName);
         if (!File.Exists(candidate))
             WalnutLogger.Warning($"Index segment '{candidate}' is missing; rebuilding index '{indexTableName}'.");
         else
@@ -636,64 +753,13 @@ public sealed class WalnutDatabase : IDatabase
 
     public async ValueTask RebuildTableAsync(string name, CancellationToken ct = default)
     {
-        if (!_tables.TryGetValue(name, out var refMem)) return;
+        // WAL is global, therefore rebuilding one table must never truncate it
+        // independently of the other tables. The safe v1 implementation uses
+        // the database-wide checkpoint path.
+        if (!_tables.ContainsKey(CanonicalizeName(name)) && !_sst.ContainsKey(CanonicalizeName(name)))
+            return;
 
-        // 1) Zamroź starą memkę dla tej tabeli (swap na świeżą)
-        var oldMem = refMem.Swap(new MemTable());
-
-        // 2) Zbierz wpisy z oldMem oraz zbuduj zbiór kluczy „pokrytych”
-        var list = new List<(byte[] Key, byte[] Val)>();
-        var covered = new HashSet<string>(); // użyjemy podpisu Base64 dla porównywania kluczy
-
-        foreach (var it in oldMem.SnapshotAll(null))
-        {
-            var sig = Convert.ToBase64String(it.Key);
-            covered.Add(sig); // klucz istnieje w snapshot'cie (żywy lub tombstone)
-
-            if (!it.Value.Tombstone && it.Value.Value is not null)
-            {
-                var v = it.Value.Value;
-                var vOut = Encryption is null ? v : Encryption.Encrypt(v, name, it.Key);
-                list.Add((it.Key, vOut));
-            }
-
-        }
-
-        // 3) Dociągnij z SST te klucze, których nie nadpisała/nie usunęła oldMem
-        foreach (var (k, v) in ScanSstRange(name, Array.Empty<byte>(), Array.Empty<byte>()))
-        {
-            var sig = Convert.ToBase64String(k);
-            if (!covered.Contains(sig))
-            {
-                var vOut = Encryption is null ? v : Encryption.Encrypt(v, name, k);
-                list.Add((k, vOut));
-            }
-        }
-
-        // 4) Posortuj i zapisz nowy SST
-        list.Sort(static (a, b) =>
-        {
-            int min = Math.Min(a.Key.Length, b.Key.Length);
-            for (int i = 0; i < min; i++) { int d = a.Key[i] - b.Key[i]; if (d != 0) return d; }
-            return a.Key.Length - b.Key.Length;
-        });
-
-        async IAsyncEnumerable<(byte[] Key, byte[] Val)> Source()
-        {
-            foreach (var t in list) { yield return t; await Task.Yield(); }
-        }
-
-        var safe = EncodeNameToFile(name);
-        var tmp = Path.Combine(_sstDir, $"{safe}.sst.tmp");
-        var dst = Path.Combine(_sstDir, $"{safe}.sst");
-
-        await SstWriter.WriteAsync(tmp, Source(), ct).ConfigureAwait(false);
-        if (File.Exists(dst)) File.Replace(tmp, dst, null); else File.Move(tmp, dst);
-        ReplaceSst(name, dst);
-
-        // 5) Trwałość
-        await Wal.FlushAsync(ct).ConfigureAwait(false);
-        await Wal.TruncateAsync(ct).ConfigureAwait(false);
+        await CheckpointAsync(ct).ConfigureAwait(false);
     }
 
     internal MemTableRef GetOrAddMemRef(string name)
@@ -705,6 +771,46 @@ public sealed class WalnutDatabase : IDatabase
         var current = _tables.AddOrUpdate(canonical, preferred, static (_, existing) => existing);
         _metrics.GetOrAdd(canonical, _ => new TableMetrics());
         return current;
+    }
+
+    private void LoadSst(string canonicalName, string path)
+    {
+        RepairInterruptedSidecarPromotion(path);
+        var reader = new SstReader(path);
+        _sst[canonicalName] = reader;
+        _tableFiles[canonicalName] = Path.GetFileName(path);
+    }
+
+    private static void RepairInterruptedSidecarPromotion(string sstPath)
+    {
+        var finalIndex = sstPath + ".sxi";
+        var temporaryIndex = sstPath + ".tmp.sxi";
+        if (File.Exists(finalIndex) || !File.Exists(temporaryIndex))
+            return;
+
+        try
+        {
+            // SstWriter creates <data-temp>.sxi. Once the data temp was
+            // promoted to the final SST, this is the matching sidecar.
+            File.Move(temporaryIndex, finalIndex);
+            WalnutLogger.Warning($"Recovered interrupted SST sidecar promotion for '{Path.GetFileName(sstPath)}'.");
+        }
+        catch (IOException ex)
+        {
+            WalnutLogger.Warning($"Could not recover SST sidecar '{temporaryIndex}': {ex.Message}");
+        }
+    }
+
+    private async ValueTask PersistCatalogAsync(CancellationToken ct)
+    {
+        _catalog = new StorageCatalog
+        {
+            CreatedWith = _catalog.CreatedWith,
+            LastSequence = Volatile.Read(ref _nextSeqNo),
+            TableFiles = _tableFiles.OrderBy(k => k.Key, StringComparer.Ordinal)
+                                    .ToDictionary(k => k.Key, v => v.Value, StringComparer.Ordinal)
+        };
+        await StorageCatalogStore.SaveAsync(_dir, _manifest, _catalog, ct).ConfigureAwait(false);
     }
 
     internal MemTableRef ReattachIndex(string indexTableName, MemTableRef preferred, bool unique)
@@ -722,8 +828,10 @@ public sealed class WalnutDatabase : IDatabase
     {
         value = null;
 
-        // Krótki retry w razie wyścigu z ReplaceSst (ObjectDisposed/IO)
-        for (int attempt = 0; attempt < 3; attempt++)
+        IOException? transientError = null;
+        // Retry only an actual sharing violation. Corruption and permanent I/O
+        // failures must never be reinterpreted as a missing row.
+        for (int attempt = 0; attempt < 50; attempt++)
         {
             try
             {
@@ -732,20 +840,23 @@ public sealed class WalnutDatabase : IDatabase
 
                 return false;
             }
-            catch (IOException)
+            catch (IOException ex) when (IsSharingViolation(ex))
             {
-                // chwilowo podmieniany plik – spróbuj ponownie
+                transientError = ex;
             }
-            catch (ObjectDisposedException)
+            catch (FileNotFoundException ex)
             {
-                // stary reader został właśnie wymieniony – spróbuj ponownie
+                transientError = ex;
+            }
+            catch (DirectoryNotFoundException ex)
+            {
+                transientError = ex;
             }
 
-            // króciutka pauza zanim sprawdzimy jeszcze raz
-            System.Threading.Thread.SpinWait(64);
+            Thread.Sleep(1);
         }
 
-        return false;
+        throw new IOException($"Could not read SST for table '{name}' because the file remained locked.", transientError);
     }
 
     internal bool IsUniqueOwner(string indexTableName, ReadOnlySpan<byte> prefix, ReadOnlySpan<byte> pk)
@@ -759,53 +870,50 @@ public sealed class WalnutDatabase : IDatabase
 
     internal IEnumerable<(byte[] Key, byte[] Val)> ScanSstRange(string name, byte[] fromInclusive, byte[] toExclusive)
     {
-        // bardzo krótki, „bezpieczny” reader – 3 podejścia i koniec
-        for (int attempt = 0; attempt < 3; attempt++)
+        IOException? transientError = null;
+        for (int attempt = 0; attempt < 50; attempt++)
         {
-            Sst.SstReader? sst;
-            if (!_sst.TryGetValue(name, out sst))
+            if (!_sst.TryGetValue(name, out var sst))
                 yield break;
 
-            IEnumerator<(byte[] Key, byte[] Val)>? it = null;
+            using var iterator = sst.ScanRange(fromInclusive, toExclusive).GetEnumerator();
+            bool hasCurrent;
             try
             {
-                it = sst.ScanRange(fromInclusive, toExclusive).GetEnumerator();
+                hasCurrent = iterator.MoveNext(); // opens the file lazily
             }
-            catch (IOException)
+            catch (IOException ex) when (ex is FileNotFoundException or DirectoryNotFoundException || IsSharingViolation(ex))
             {
-                System.Threading.Thread.SpinWait(64);
+                transientError = ex;
+                Thread.Sleep(1);
                 continue;
             }
 
-            using (it)
+            while (hasCurrent)
             {
-                while (true)
-                {
-                    bool ok;
-                    try { ok = it.MoveNext(); }
-                    catch (IOException) { ok = false; }
-                    if (!ok) yield break;
-
-                    yield return it.Current;
-                }
+                yield return iterator.Current;
+                // Once opened, the stream retains the old file across atomic
+                // replacement. Any later IOException is real and is propagated.
+                hasCurrent = iterator.MoveNext();
             }
-
-            yield break; // sukces – nie próbujemy ponownie
+            yield break;
         }
 
-        // po 3 próbach – oddaj pustą sekwencję
-        yield break;
+        throw new IOException($"Could not scan SST for table '{name}' because the file remained unavailable.", transientError);
     }
 
 
     private void ReplaceSst(string name, string newPath)
     {
         var reader = new SstReader(newPath);
-        if (_sst.TryRemove(name, out var old))
+        SstReader? replaced = null;
+        _sst.AddOrUpdate(name, reader, (_, old) =>
         {
-            try { old.Dispose(); } catch { }
-        }
-        _sst[name] = reader;
+            replaced = old;
+            return reader;
+        });
+        if (replaced is not null)
+            try { replaced.Dispose(); } catch { }
     }
 
     private static string CanonicalizeName(string raw)
@@ -875,11 +983,33 @@ public sealed class WalnutDatabase : IDatabase
         return IsSafeFileName(logicalName) ? logicalName : Base64UrlEncode(logicalName);
     }
 
+    private string GetSstFileName(string logicalName)
+    {
+        if (_tableFiles.TryGetValue(logicalName, out var existing))
+            return existing;
+
+        var candidate = EncodeNameToFile(logicalName) + ".sst";
+        foreach (var mapping in _tableFiles)
+        {
+            if (!string.Equals(mapping.Key, logicalName, StringComparison.Ordinal) &&
+                string.Equals(mapping.Value, candidate, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException($"Tables '{logicalName}' and '{mapping.Key}' resolve to the same SST file '{candidate}'. Use distinct explicit table names.");
+        }
+
+        return candidate;
+    }
+
+    private string GetSstPath(string logicalName)
+        => Path.Combine(_sstDir, GetSstFileName(logicalName));
+
     private static string DecodeNameFromFile(string fileBaseName)
     {
         // Rozpoznaj *kanoniczne* Base64-url: dekoduj bajty, sprawdź round-trip do identycznego ciągu
         // i zaakceptuj TYLKO gdy UTF-8 jest poprawny.
-        if (TryDecodeBase64UrlRoundtrip(fileBaseName, out var decoded))
+        // The legacy encoder only used Base64 when the logical name itself was
+        // unsafe as a file name. A safe decoded value therefore proves that the
+        // Base64-looking file name was meant literally (e.g. "YWJj").
+        if (TryDecodeBase64UrlRoundtrip(fileBaseName, out var decoded) && !IsSafeFileName(decoded))
             return decoded;
 
         // Nie jest prawidłowym Base64-url → traktuj jako jawną nazwę.
@@ -919,107 +1049,200 @@ public sealed class WalnutDatabase : IDatabase
 
     public async ValueTask CheckpointAsync(CancellationToken ct = default)
     {
-        var snapshot = new List<(string Name, MemTable Old)>(_tables.Count);
+        // The writer lease waits for commits already in progress and prevents
+        // new commits from entering until all SST files are durable and the WAL
+        // has been truncated. MemTables stay attached until every SST succeeds,
+        // so cancellation/failure cannot make live data disappear in-process.
+        await using var maintenanceLease = await MaintenanceGate.EnterWriteAsync(ct).ConfigureAwait(false);
+        var snapshot = _tables.ToArray();
 
-        await WriterLock.WaitAsync(ct).ConfigureAwait(false);
-        try
+        foreach (var entry in snapshot)
         {
-            foreach (var kv in _tables.ToArray())
-            {
-                ct.ThrowIfCancellationRequested();
-                var (name, @ref) = (kv.Key, kv.Value);
-                var old = @ref.Swap(new MemTable());
-                snapshot.Add((name, old));
-            }
-        }
-        finally { WriterLock.Release(); }
-
-        var enc = Encryption;
-
-        foreach (var (name, oldMem) in snapshot)
-        {
+            var name = entry.Key;
+            var mem = entry.Value.Current;
             ct.ThrowIfCancellationRequested();
 
             bool isIndex = name.StartsWith("__index__", StringComparison.Ordinal);
             bool isUniqueIndex = isIndex && IsIndexUnique(name);
 
-            var coveredExact = new HashSet<string>(StringComparer.Ordinal);
+            var dst = GetSstPath(name);
+            var tmp = dst + ".tmp";
+            TryDeleteFile(tmp);
+            TryDeleteFile(tmp + ".sxi");
+            EnsureCheckpointSpace(dst, mem);
 
-            List<(byte[] Key, byte[] Val)> outList =
-                (!isIndex || !isUniqueIndex) ? new() : null!;
-
-            Dictionary<string, (byte[] Key, byte[] Val)> outByPrefix =
-                (isIndex && isUniqueIndex) ? new(StringComparer.Ordinal) : null!;
-
-            // 2a) Z RAM (snapshot)
-            foreach (var it in oldMem.SnapshotAll(afterKeyExclusive: null))
+            try
             {
-                coveredExact.Add(Convert.ToBase64String(it.Key));
-
-                if (it.Value.Tombstone || it.Value.Value is null) continue;
-
-                if (!isIndex || !isUniqueIndex)
-                {
-                    var vOut = enc is null ? it.Value.Value : enc.Encrypt(it.Value.Value, name, it.Key);
-                    outList.Add((it.Key, vOut));
-                }
-                else
-                {
-                    var pSig = Convert.ToBase64String(IndexKeyCodec.ExtractValuePrefix(it.Key));
-                    var vOut = enc is null ? it.Value.Value : enc.Encrypt(it.Value.Value, name, it.Key);
-                    outByPrefix[pSig] = (it.Key, vOut); // RAM wygrywa w danym prefiksie
-                }
+                await SstWriter.WriteAsync(tmp, StreamCheckpointRows(name, mem, isIndex, isUniqueIndex, ct), ct).ConfigureAwait(false);
+                // Remove the old optional sidecar before replacing data. This makes
+                // every crash point safe: old data without an index or new data
+                // without an index are both readable by a full scan.
+                TryDeleteFile(dst + ".sxi");
+                if (File.Exists(dst)) File.Replace(tmp, dst, null); else File.Move(tmp, dst);
+                ReplaceSst(name, dst);
+                PromoteSstSidecar(tmp + ".sxi", dst + ".sxi");
+                if (File.Exists(dst + ".sxi"))
+                    ReplaceSst(name, dst); // reload the freshly promoted sparse index
+                _tableFiles[name] = Path.GetFileName(dst);
             }
-
-            // 2b) Z poprzedniego SST
-            if (_sst.TryGetValue(name, out var prev))
+            catch
             {
-                foreach (var (k, v) in prev.ScanRange(Array.Empty<byte>(), Array.Empty<byte>()))
-                {
-                    if (coveredExact.Contains(Convert.ToBase64String(k))) continue;
-
-                    if (!isIndex || !isUniqueIndex)
-                    {
-                        outList.Add((k, v));
-                    }
-                    else
-                    {
-                        var pSig = Convert.ToBase64String(IndexKeyCodec.ExtractValuePrefix(k));
-                        if (!outByPrefix.ContainsKey(pSig))
-                            outByPrefix[pSig] = (k, v);
-                    }
-                }
+                TryDeleteFile(tmp);
+                TryDeleteFile(tmp + ".sxi");
+                throw;
             }
+        }
 
-            IEnumerable<(byte[] Key, byte[] Val)> materialized =
-            (isIndex && isUniqueIndex)
-                ? (IEnumerable<(byte[] Key, byte[] Val)>)outByPrefix.Values
-                : outList;
+        // Commit the small metadata mapping before the global WAL is removed.
+        await PersistCatalogAsync(ct).ConfigureAwait(false);
 
-            var list = new List<(byte[] Key, byte[] Val)>(materialized);
-            list.Sort(static (a, b) =>
-            {
-                int min = Math.Min(a.Key.Length, b.Key.Length);
-                for (int i = 0; i < min; i++) { int d = a.Key[i] - b.Key[i]; if (d != 0) return d; }
-                return a.Key.Length - b.Key.Length;
-            });
-
-            async IAsyncEnumerable<(byte[] Key, byte[] Val)> Source()
-            {
-                foreach (var t in list) { yield return t; await Task.Yield(); }
-            }
-
-            var safe = EncodeNameToFile(name);
-            var tmp = Path.Combine(_sstDir, $"{safe}.sst.tmp");
-            var dst = Path.Combine(_sstDir, $"{safe}.sst");
-
-            await SstWriter.WriteAsync(tmp, Source(), ct).ConfigureAwait(false);
-            if (File.Exists(dst)) File.Replace(tmp, dst, null); else File.Move(tmp, dst);
-            ReplaceSst(name, dst);
+        // All replacements succeeded. Current MemTables are now fully covered
+        // by the new SST set, so they can be cleared atomically for writers.
+        await WriterLock.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+        try
+        {
+            foreach (var entry in snapshot)
+                entry.Value.Swap(new MemTable());
+        }
+        finally
+        {
+            WriterLock.Release();
         }
 
         await Wal.FlushAsync(ct).ConfigureAwait(false);
         await Wal.TruncateAsync(ct).ConfigureAwait(false);
+    }
+
+    private async IAsyncEnumerable<(byte[] Key, byte[] Val)> StreamCheckpointRows(
+        string name,
+        MemTable mem,
+        bool isIndex,
+        bool isUniqueIndex,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct)
+    {
+        using var memRows = mem.SnapshotAll(afterKeyExclusive: null).GetEnumerator();
+        IEnumerator<(byte[] Key, byte[] Val)>? sstRows = null;
+        if (_sst.TryGetValue(name, out var previous))
+            sstRows = previous.ScanRange(Array.Empty<byte>(), Array.Empty<byte>()).GetEnumerator();
+
+        using (sstRows)
+        {
+            bool hasMem = memRows.MoveNext();
+            bool hasSst = sstRows?.MoveNext() == true;
+            byte[]? uniquePrefix = null;
+            (byte[] Key, byte[] Val, bool FromMem)? uniqueCandidate = null;
+            int yielded = 0;
+
+            while (hasMem || hasSst)
+            {
+                ct.ThrowIfCancellationRequested();
+                (byte[] Key, byte[] Val, bool FromMem)? row = null;
+
+                int comparison = hasMem && hasSst
+                    ? ByteArrayComparer.Instance.Compare(memRows.Current.Key, sstRows!.Current.Key)
+                    : hasMem ? -1 : 1;
+
+                if (hasMem && comparison <= 0)
+                {
+                    var current = memRows.Current;
+                    hasMem = memRows.MoveNext();
+                    if (comparison == 0)
+                        hasSst = sstRows!.MoveNext();
+
+                    if (!current.Value.Tombstone && current.Value.Value is not null)
+                    {
+                        var value = Encryption is null || isIndex
+                            ? current.Value.Value
+                            : Encryption.Encrypt(current.Value.Value, name, current.Key);
+                        row = (current.Key, value, true);
+                    }
+                }
+                else
+                {
+                    var current = sstRows!.Current;
+                    hasSst = sstRows.MoveNext();
+                    row = (current.Key, current.Val, false);
+                }
+
+                if (row is null)
+                    continue;
+
+                if (!isUniqueIndex)
+                {
+                    yield return (row.Value.Key, row.Value.Val);
+                }
+                else
+                {
+                    var prefix = IndexKeyCodec.ExtractValuePrefix(row.Value.Key);
+                    if (uniquePrefix is null || !ByteArrayComparer.Instance.Equals(uniquePrefix, prefix))
+                    {
+                        if (uniqueCandidate is not null)
+                            yield return (uniqueCandidate.Value.Key, uniqueCandidate.Value.Val);
+                        uniquePrefix = prefix;
+                        uniqueCandidate = row;
+                    }
+                    else if (uniqueCandidate is null || row.Value.FromMem || !uniqueCandidate.Value.FromMem)
+                    {
+                        // MemTable wins over SST; for multiple legacy duplicates
+                        // from the same source retain the last sorted owner.
+                        uniqueCandidate = row;
+                    }
+                }
+
+                if (++yielded % 1024 == 0)
+                    await Task.Yield();
+            }
+
+            if (isUniqueIndex && uniqueCandidate is not null)
+                yield return (uniqueCandidate.Value.Key, uniqueCandidate.Value.Val);
+        }
+    }
+
+    private void EnsureCheckpointSpace(string currentSstPath, MemTable mem)
+    {
+        long estimate;
+        try
+        {
+            estimate = File.Exists(currentSstPath) ? new FileInfo(currentSstPath).Length : 12;
+            foreach (var row in mem.SnapshotAll(afterKeyExclusive: null))
+                if (!row.Value.Tombstone && row.Value.Value is not null)
+                    estimate = checked(estimate + row.Key.LongLength + row.Value.Value.LongLength + 64L);
+
+            estimate = checked(estimate + 1024L * 1024L);
+            var root = Path.GetPathRoot(Path.GetFullPath(_sstDir));
+            if (string.IsNullOrWhiteSpace(root))
+                return;
+
+            long free = new DriveInfo(root).AvailableFreeSpace;
+            if (free < estimate)
+                throw new InsufficientCheckpointSpaceException(estimate, free);
+        }
+        catch (Exception ex)
+        {
+            if (ex is InsufficientCheckpointSpaceException)
+                throw;
+            WalnutLogger.Warning($"Could not determine free space before checkpoint: {ex.Message}");
+        }
+    }
+
+    private sealed class InsufficientCheckpointSpaceException : IOException
+    {
+        public InsufficientCheckpointSpaceException(long required, long available)
+            : base($"Checkpoint requires approximately {required} free bytes but only {available} bytes are available. WAL was preserved.") { }
+    }
+
+    private static void PromoteSstSidecar(string temporaryIndex, string finalIndex)
+    {
+        if (!File.Exists(temporaryIndex))
+        {
+            TryDeleteFile(finalIndex); // never keep an index for an older SST
+            return;
+        }
+
+        if (File.Exists(finalIndex))
+            File.Replace(temporaryIndex, finalIndex, destinationBackupFileName: null);
+        else
+            File.Move(temporaryIndex, finalIndex);
     }
 
     public ValueTask<DbStats> GetStatsAsync(CancellationToken ct = default)
@@ -1049,15 +1272,21 @@ public sealed class WalnutDatabase : IDatabase
 
             long live = 0;
             long dead = 0;
+            long memLive = 0;
             int sstCount = 0;
             long sstSizeBytes = 0;
+            var coveredByMem = new HashSet<byte[]>(ByteArrayComparer.Instance);
 
             if (_tables.TryGetValue(name, out var memRef))
             {
                 foreach (var kv in memRef.Current.SnapshotAll(afterKeyExclusive: null))
                 {
-                    if (kv.Value.Tombstone) dead++;
-                    else if (kv.Value.Value is not null) live += kv.Value.Value.LongLength;
+                    coveredByMem.Add(kv.Key);
+                    if (!kv.Value.Tombstone && kv.Value.Value is not null)
+                    {
+                        memLive += kv.Value.Value.LongLength;
+                        live += kv.Value.Value.LongLength;
+                    }
                 }
             }
 
@@ -1071,7 +1300,10 @@ public sealed class WalnutDatabase : IDatabase
                 catch { /* ignore */ }
 
                 foreach (var kv in sst.ScanRange(Array.Empty<byte>(), Array.Empty<byte>()))
-                    live += kv.Val.LongLength;
+                {
+                    if (coveredByMem.Contains(kv.Key)) dead += kv.Val.LongLength;
+                    else live += kv.Val.LongLength;
+                }
             }
 
             totalLive += live;
@@ -1079,7 +1311,7 @@ public sealed class WalnutDatabase : IDatabase
 
             double frag = (live + dead) > 0 ? (double)dead / (live + dead) * 100.0 : 0.0;
             tables.Add(new TableStats(name,
-                TotalBytes: sstSizeBytes + live,
+                TotalBytes: sstSizeBytes + memLive,
                 LiveBytes: live,
                 DeadBytes: dead,
                 SstCount: sstCount,
@@ -1096,9 +1328,20 @@ public sealed class WalnutDatabase : IDatabase
 
     public async ValueTask<BackupResult> CreateBackupAsync(string targetDir, CancellationToken ct = default)
     {
+        var sourceFull = Path.GetFullPath(_dir).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        var targetFull = Path.GetFullPath(targetDir).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        if (targetFull.StartsWith(sourceFull, StringComparison.OrdinalIgnoreCase) ||
+            sourceFull.StartsWith(targetFull, StringComparison.OrdinalIgnoreCase))
+            throw new ArgumentException("Backup target must be outside the database directory.", nameof(targetDir));
+
+        await using var maintenanceLease = await MaintenanceGate.EnterWriteAsync(ct).ConfigureAwait(false);
         Directory.CreateDirectory(targetDir);
+        using var targetLock = new FileStream(Path.Combine(targetDir, ".walnutdb.lock"),
+            FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
         var targetSstDir = Path.Combine(targetDir, "sst");
         Directory.CreateDirectory(targetSstDir);
+        var incompleteMarker = Path.Combine(targetDir, ".walnutdb-backup-incomplete");
+        WriteDurableMarker(incompleteMarker, "Backup is incomplete.\n");
 
         // 1) Trwały flush WAL do bieżącego pliku
         await Wal.FlushAsync(ct).ConfigureAwait(false);
@@ -1106,7 +1349,12 @@ public sealed class WalnutDatabase : IDatabase
         long copied = 0;
 
         // 2) Skopiuj wszystkie *.sst (snapshot listy; kopiuj z Share Read/Write)
-        foreach (var file in Directory.EnumerateFiles(_sstDir, "*.sst"))
+        var sourceSstArtifacts = Directory.EnumerateFiles(_sstDir)
+            .Where(path => path.EndsWith(".sst", StringComparison.OrdinalIgnoreCase) ||
+                           path.EndsWith(".sst.sxi", StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        var sourceSstNames = new HashSet<string>(sourceSstArtifacts.Select(path => Path.GetFileName(path)!), StringComparer.OrdinalIgnoreCase);
+        foreach (var file in sourceSstArtifacts)
         {
             ct.ThrowIfCancellationRequested();
             var dst = Path.Combine(targetSstDir, Path.GetFileName(file));
@@ -1114,6 +1362,7 @@ public sealed class WalnutDatabase : IDatabase
             using (var dstFs = new FileStream(dst, FileMode.Create, FileAccess.Write, FileShare.None))
             {
                 await src.CopyToAsync(dstFs, ct).ConfigureAwait(false);
+                dstFs.Flush(true);
                 copied += dstFs.Length;
             }
         }
@@ -1130,15 +1379,22 @@ public sealed class WalnutDatabase : IDatabase
             using (var dstFs = new FileStream(dst, FileMode.Create, FileAccess.Write, FileShare.None))
             {
                 await src.CopyToAsync(dstFs, ct).ConfigureAwait(false);
+                dstFs.Flush(true);
                 copied += dstFs.Length;
             }
         }
+        else
+        {
+            TryDeleteFile(Path.Combine(targetDir, "wal.log"));
+        }
 
-        // (opcjonalnie) manifesty
-        foreach (var mf in Directory.EnumerateFiles(_dir, "*.manifest"))
+        // Manifest and CURRENT are part of the consistency boundary.
+        var sourceManifests = Directory.EnumerateFiles(_dir, "MANIFEST-*").ToArray();
+        var sourceManifestNames = new HashSet<string>(sourceManifests.Select(path => Path.GetFileName(path)!), StringComparer.OrdinalIgnoreCase);
+        foreach (var mf in sourceManifests)
         {
             var dst = Path.Combine(targetDir, Path.GetFileName(mf));
-            File.Copy(mf, dst, overwrite: true);
+            CopyFileDurably(mf, dst);
             try
             {
                 copied += new FileInfo(mf).Length;
@@ -1146,110 +1402,87 @@ public sealed class WalnutDatabase : IDatabase
             catch { /* best-effort */ }
         }
 
+        var currentPath = Path.Combine(_dir, "CURRENT");
+        if (File.Exists(currentPath))
+        {
+            var dst = Path.Combine(targetDir, "CURRENT");
+            CopyFileDurably(currentPath, dst);
+            copied += new FileInfo(currentPath).Length;
+        }
+
+        // Remove database artifacts left by an older backup in the same target.
+        foreach (var stale in Directory.EnumerateFiles(targetSstDir))
+        {
+            var fileName = Path.GetFileName(stale);
+            if ((fileName.EndsWith(".sst", StringComparison.OrdinalIgnoreCase) ||
+                 fileName.EndsWith(".sst.sxi", StringComparison.OrdinalIgnoreCase)) &&
+                !sourceSstNames.Contains(fileName))
+                File.Delete(stale);
+        }
+        foreach (var stale in Directory.EnumerateFiles(targetDir, "MANIFEST-*"))
+            if (!sourceManifestNames.Contains(Path.GetFileName(stale)))
+                File.Delete(stale);
+
+        File.Delete(incompleteMarker);
+
         return new BackupResult(targetDir, copied);
+    }
+
+    private static void WriteDurableMarker(string path, string contents)
+    {
+        var bytes = Encoding.UTF8.GetBytes(contents);
+        using var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.Read,
+            bufferSize: 4096, options: FileOptions.WriteThrough);
+        fs.Write(bytes);
+        fs.Flush(true);
+    }
+
+    private static void CopyFileDurably(string source, string destination)
+    {
+        using var input = new FileStream(source, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        using var output = new FileStream(destination, FileMode.Create, FileAccess.Write, FileShare.None,
+            bufferSize: 81920, options: FileOptions.WriteThrough);
+        input.CopyTo(output);
+        output.Flush(true);
     }
 
     public async ValueTask DefragmentAsync(DefragMode mode, CancellationToken ct = default)
     {
-        // MVP: „defragmentacja” == pełny rebuild SST z aktualnego widoku + opróżnienie Mem (swap),
-        //       a potem truncate WAL. Wymaga chwilowego single-writera na czas swapu memek.
-        //       Działa identycznie dla Compact i RebuildSwap w tym modelu 1-SST-na-tabelę.
+        if (mode is not DefragMode.Compact and not DefragMode.RebuildSwap)
+            throw new ArgumentOutOfRangeException(nameof(mode));
 
-        // 1) Zbuduj świeże SST z live view (Mem ∪ SST)
-        foreach (var kv in _tables.ToArray())
-        {
-            ct.ThrowIfCancellationRequested();
-            var name = kv.Key;
-
-            // poskładamy pełny widok jako async-enum (merge zrobi DefaultTable.ScanByKeyAsync,
-            // ale tu zrobimy lokalnie: Mem.Current + SST -> lista posortowana)
-            var mem = kv.Value.Current;
-
-            // zbierz live wpisy z Mem
-            var live = new List<(byte[] Key, byte[] Val)>();
-            foreach (var it in mem.SnapshotAll(afterKeyExclusive: null))
-                if (!it.Value.Tombstone && it.Value.Value is not null)
-                {
-                    var v = it.Value.Value;
-                    var vOut = Encryption is null ? v : Encryption.Encrypt(v, name, it.Key);
-                    live.Add((it.Key, vOut));
-                }
-
-            // dołóż wszystko z aktualnego SST (jeśli klucz nie jest nadpisany przez Mem)
-            if (_sst.TryGetValue(name, out var sst))
-            {
-                foreach (var it in sst.ScanRange(Array.Empty<byte>(), Array.Empty<byte>()))
-                {
-                    // jeśli Mem nie ma override, weź z SST
-                    // (proste sprawdzenie – w małej bazie OK; dla większej można sortować/mergować)
-                    bool overridden = mem.TryGet(it.Key, out var raw) && raw is not null;
-                    if (!overridden)
-                    {
-                        var vOut = Encryption is null ? it.Val : Encryption.Encrypt(it.Val, name, it.Key);
-                        live.Add((it.Key, vOut));
-                    }
-                }
-            }
-
-            // posortuj po kluczu
-            live.Sort(static (a, b) =>
-            {
-                int min = Math.Min(a.Key.Length, b.Key.Length);
-                for (int i = 0; i < min; i++)
-                {
-                    int d = a.Key[i] - b.Key[i];
-                    if (d != 0) return d;
-                }
-                return a.Key.Length - b.Key.Length;
-            });
-
-            // asynchroniczne źródło
-            async IAsyncEnumerable<(byte[] Key, byte[] Val)> AllAsync()
-            {
-                foreach (var t in live) { yield return t; await Task.Yield(); }
-            }
-
-            var safe = EncodeNameToFile(name);
-            var tmp = Path.Combine(_sstDir, $"{safe}.sst.tmp");
-            var dst = Path.Combine(_sstDir, $"{safe}.sst");
-
-            await SstWriter.WriteAsync(tmp, AllAsync(), ct).ConfigureAwait(false);
-
-            if (File.Exists(dst))
-                File.Replace(tmp, dst, destinationBackupFileName: null);
-            else
-                File.Move(tmp, dst);
-
-            ReplaceSst(name, dst);
-        }
-
-        // 2) Wymiana MemTableRef na świeże (czyści tombstony i „pofragmentowanie” pamięci)
-        await WriterLock.WaitAsync(ct).ConfigureAwait(false);
-        try
-        {
-            foreach (var k in _tables.Keys)
-            {
-                // swap na pustą memę
-                var old = _tables[k].Swap(new MemTable());
-                // stara instancja do GC
-            }
-        }
-        finally
-        {
-            WriterLock.Release();
-        }
-
-        // 3) Opróżnij WAL
-        await Wal.FlushAsync(ct).ConfigureAwait(false);
-        if (Wal is WalWriter ww)
-            await ww.TruncateAsync(ct).ConfigureAwait(false);
+        // With one SST per table, a checkpoint already produces the compact,
+        // tombstone-free representation. Reusing the single safe implementation
+        // also avoids ciphertext double-encryption and concurrent-write loss.
+        await CheckpointAsync(ct).ConfigureAwait(false);
     }
 
     public ValueTask<StorageVersionInfo> GetStorageVersionAsync(CancellationToken ct = default)
-        => ValueTask.FromResult(new StorageVersionInfo(1, "WalnutDb-0.1", Array.Empty<string>()));
+        => ValueTask.FromResult(new StorageVersionInfo(
+            _catalog.StorageVersion,
+            _catalog.CreatedWith,
+            new[] { _catalog.WalFormat, _catalog.SstFormat, $"manifest-v{_catalog.ManifestVersion}" }));
 
     public async ValueTask DisposeAsync()
     {
+        if (Interlocked.Exchange(ref _disposeOnce, 1) != 0)
+            return;
+
+        Exception? checkpointError = null;
+        if (_options.CheckpointOnDispose)
+        {
+            try
+            {
+                await CheckpointAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                // Keep disposing so the WAL queue is drained. The WAL remains
+                // the recovery source when checkpointing failed.
+                checkpointError = ex;
+            }
+        }
+
         foreach (var s in _sst.Values)
             try
             {
@@ -1261,6 +1494,13 @@ public sealed class WalnutDatabase : IDatabase
 
         if (_options.Encryption is IDisposable disp)
             disp.Dispose();
+
+        _databaseLock.Dispose();
+        MaintenanceGate.Dispose();
+        WriterLock.Dispose();
+
+        if (checkpointError is not null)
+            throw new IOException("Checkpoint-on-dispose failed; WAL was preserved for recovery.", checkpointError);
     }
 
     public ValueTask FlushAsync(CancellationToken ct = default)
@@ -1268,6 +1508,7 @@ public sealed class WalnutDatabase : IDatabase
 
     public async ValueTask<ITable<T>> OpenTableAsync<T>(string name, TableOptions<T> options, CancellationToken ct = default)
     {
+        ObjectDisposedException.ThrowIf(IsDisposing, this);
         var canonical = CanonicalizeName(name);
         var memRef = GetOrAddMemRef(canonical);
         await Task.Yield();
@@ -1279,6 +1520,7 @@ public sealed class WalnutDatabase : IDatabase
 
     public async ValueTask DropTableAsync(string name, CancellationToken ct = default)
     {
+        await using var maintenanceLease = await MaintenanceGate.EnterReadAsync(ct).ConfigureAwait(false);
         name = CanonicalizeName(name);
 
         var txId = (ulong)(Random.Shared.NextInt64() & long.MaxValue);
@@ -1294,7 +1536,7 @@ public sealed class WalnutDatabase : IDatabase
         var handle = await Wal.AppendTransactionAsync(frames, Durability.Safe, ct).ConfigureAwait(false);
         await handle.WhenCommitted.ConfigureAwait(false);
 
-        await WriterLock.WaitAsync(ct).ConfigureAwait(false);
+        await WriterLock.WaitAsync(CancellationToken.None).ConfigureAwait(false);
         try
         {
             DropTableInMemory(name);
@@ -1304,6 +1546,7 @@ public sealed class WalnutDatabase : IDatabase
             WriterLock.Release();
         }
 
+        await PersistCatalogAsync(ct).ConfigureAwait(false);
         await Wal.FlushAsync(ct).ConfigureAwait(false);
     }
 
@@ -1361,11 +1604,12 @@ public sealed class WalnutDatabase : IDatabase
 
     private void DeleteTableFiles(string canonicalName)
     {
-        var safe = EncodeNameToFile(canonicalName);
-        TryDeleteFile(Path.Combine(_sstDir, $"{safe}.sst"));
-        TryDeleteFile(Path.Combine(_sstDir, $"{safe}.sst.sxi"));
-        TryDeleteFile(Path.Combine(_sstDir, $"{safe}.sst.tmp"));
-        TryDeleteFile(Path.Combine(_sstDir, $"{safe}.sst.tmp.sxi"));
+        var sst = GetSstPath(canonicalName);
+        TryDeleteFile(sst);
+        TryDeleteFile(sst + ".sxi");
+        TryDeleteFile(sst + ".tmp");
+        TryDeleteFile(sst + ".tmp.sxi");
+        _tableFiles.TryRemove(canonicalName, out _);
     }
 
     private static void TryDeleteFile(string path)
@@ -1400,7 +1644,9 @@ public sealed class WalnutDatabase : IDatabase
         foreach (var file in Directory.EnumerateFiles(_sstDir, "*.sst"))
         {
             var baseName = Path.GetFileNameWithoutExtension(file);
-            var logical = DecodeNameFromFile(baseName);
+            var logical = _options.LegacyTableNameMappings?.TryGetValue(baseName, out var configured) == true
+                ? configured
+                : DecodeNameFromFile(baseName);
             var canonical = CanonicalizeName(logical);
             if (IsDropped(canonical))
             {
@@ -1413,7 +1659,9 @@ public sealed class WalnutDatabase : IDatabase
         {
             var fn = Path.GetFileName(file);
             var stem = fn.Substring(0, fn.Length - ".sst.tmp".Length);
-            var logical = DecodeNameFromFile(stem);
+            var logical = _options.LegacyTableNameMappings?.TryGetValue(stem, out var configured) == true
+                ? configured
+                : DecodeNameFromFile(stem);
             var canonical = CanonicalizeName(logical);
             if (IsDropped(canonical))
             {
@@ -1472,6 +1720,7 @@ public sealed class WalnutDatabase : IDatabase
 
     public async ValueTask<ITransaction> BeginTransactionAsync(CancellationToken ct = default)
     {
+        ObjectDisposedException.ThrowIf(IsDisposing, this);
         var txId = (ulong)(Random.Shared.NextInt64() & long.MaxValue);
         var seq = (ulong)Interlocked.Increment(ref _nextSeqNo);
         await Task.Yield();

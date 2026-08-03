@@ -30,14 +30,14 @@ public sealed class WalDiagnosticsTests
         var dir = NewTempDir();
         var walPath = Path.Combine(dir, "wal.log");
 
-        await using (var db = new WalnutDatabase(dir, new DatabaseOptions(), new FileSystemManifestStore(dir), new WalWriter(walPath)))
+        await using (var db = new WalnutDatabase(dir, new DatabaseOptions { CheckpointOnDispose = false }, new FileSystemManifestStore(dir), new WalWriter(walPath)))
         {
-            var table = await db.OpenTableAsync<DiagDoc>("diag_docs", new TableOptions<DiagDoc> { GetId = d => d.Id }).ConfigureAwait(false);
+            var table = await db.OpenTableAsync<DiagDoc>("diag_docs", new TableOptions<DiagDoc> { GetId = d => d.Id });
 
             for (int i = 0; i < 3; i++)
-                await table.UpsertAsync(new DiagDoc { Id = "dup", Value = i }).ConfigureAwait(false);
+                await table.UpsertAsync(new DiagDoc { Id = "dup", Value = i });
 
-            await db.FlushAsync().ConfigureAwait(false);
+            await db.FlushAsync();
         }
 
         var report = WalDiagnostics.Scan(walPath, tailHistory: 0);
