@@ -17,12 +17,18 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "WalnutDb.Tests.Migration", 
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "WalnutDb.Tests.Safety", "WalnutDb.Tests\WalnutDb.Tests.Safety\WalnutDb.Tests.Safety.csproj", "{46376B2C-BB57-4336-B0FD-A7E74392869C}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "WalnutDb.Tests.V2", "WalnutDb.Tests\WalnutDb.Tests.V2\WalnutDb.Tests.V2.csproj", "{67E343DF-487D-4016-A543-98F800EB1023}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
 		Release|Any CPU = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{67E343DF-487D-4016-A543-98F800EB1023}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{67E343DF-487D-4016-A543-98F800EB1023}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{67E343DF-487D-4016-A543-98F800EB1023}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{67E343DF-487D-4016-A543-98F800EB1023}.Release|Any CPU.Build.0 = Release|Any CPU
 		{9C375709-DF09-489B-A087-06D4575E18F9}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
 		{9C375709-DF09-489B-A087-06D4575E18F9}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{9C375709-DF09-489B-A087-06D4575E18F9}.Release|Any CPU.ActiveCfg = Release|Any CPU

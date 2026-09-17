@@ -4,11 +4,34 @@ using System.Buffers.Binary;
 
 namespace WalnutDb.Sst
 {
-    internal sealed class SstReader : IDisposable
+    internal sealed class SstReader : ITableReader
     {
         private static readonly byte[] Header = new byte[] { (byte)'S', (byte)'S', (byte)'T', (byte)'v', (byte)'1', 0, 0, 0 };
 
         public string Path { get; }
+        private readonly FileStream _source;
+        private readonly object _leaseLock = new();
+        private int _activeReaders;
+        private bool _retired;
+        private readonly TaskCompletionSource _drained = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        private IDisposable Pin()
+        {
+            lock (_leaseLock)
+            {
+                if (_retired) throw new ObjectDisposedException(nameof(SstReader));
+                _activeReaders++;
+                return new ReaderLease(this);
+            }
+        }
+        private sealed class ReaderLease(SstReader owner) : IDisposable
+        {
+            public void Dispose() { lock (owner._leaseLock) { if (--owner._activeReaders == 0 && owner._retired) { owner._source.Dispose(); owner._drained.TrySetResult(); } } }
+        }
+        public Task Retire()
+        {
+            lock (_leaseLock) { _retired = true; if (_activeReaders == 0) { _source.Dispose(); _drained.TrySetResult(); } return _drained.Task; }
+        }
 
         // —— indeks poboczny (opcjonalny) ——
         private readonly byte[][]? _idxKeys;
@@ -17,7 +40,11 @@ namespace WalnutDb.Sst
         public SstReader(string path)
         {
             Path = path ?? throw new ArgumentNullException(nameof(path));
+            _source = new FileStream(Path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete,
+                4096, FileOptions.RandomAccess);
 
+            try
+            {
             using var fs = OpenRead();
             if (fs.Length < Header.Length + 4)
                 throw new InvalidDataException("SST file is shorter than its header and trailer.");
@@ -46,10 +73,13 @@ namespace WalnutDb.Sst
                 _idxKeys = null;
                 _idxOffsets = null;
             }
+            }
+            catch { _source.Dispose(); throw; }
         }
 
         public bool TryGet(ReadOnlySpan<byte> key, out byte[]? value)
         {
+            using var lease = Pin();
             value = null;
 
             using var fs = OpenRead();
@@ -97,6 +127,7 @@ namespace WalnutDb.Sst
 
         public System.Collections.Generic.IEnumerable<(byte[] Key, byte[] Val)> ScanRange(byte[]? fromInclusive, byte[]? toExclusive)
         {
+            using var lease = Pin();
             using var fs = OpenRead();
 
             // —— jeśli mamy indeks, przeskocz od razu do okolic fromInclusive ——
@@ -154,15 +185,9 @@ namespace WalnutDb.Sst
             }
         }
 
-        private FileStream OpenRead() => new FileStream(Path, new FileStreamOptions
-        {
-            Mode = FileMode.Open,
-            Access = FileAccess.Read,
-            Share = FileShare.ReadWrite | FileShare.Delete,
-            Options = FileOptions.SequentialScan
-        });
+        private Stream OpenRead() => new BufferedStream(new RandomAccessReadStream(_source.SafeFileHandle), 64 * 1024);
 
-        private static void ValidateLayout(FileStream fs)
+        private static void ValidateLayout(Stream fs)
         {
             long endPos = fs.Length - 4;
             fs.Position = Header.Length;
@@ -207,6 +232,6 @@ namespace WalnutDb.Sst
             return a.Length - b.Length;
         }
 
-        public void Dispose() { /* nic do zwalniania */ }
+        public void Dispose() => Retire();
     }
 }

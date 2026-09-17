@@ -8,22 +8,26 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
       - name: Restore
-        run: dotnet restore
+        run: dotnet restore WalnutDb.sln
       - name: Build
-        run: dotnet build --configuration Release --no-restore
+        run: dotnet build WalnutDb.sln --configuration Release --no-restore -p:GeneratePackageOnBuild=false /warnaserror
       - name: Test
-        run: dotnet test --configuration Release --no-build --verbosity normal
+        run: dotnet test WalnutDb.sln --configuration Release --no-build --no-restore --verbosity normal
       - name: Pack
-        run: dotnet pack src/WalnutDb/WalnutDb.csproj -c Release -o ./artifacts
+        run: dotnet pack WalnutDb/WalnutDb.csproj -c Release --no-build --no-restore -o ./artifacts
       - name: Upload package
         uses: actions/upload-artifact@v4
         with:
-          name: nupkg
+          name: nupkg-${{ runner.os }}
           path: artifacts/*.nupkg

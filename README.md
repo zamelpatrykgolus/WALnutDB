@@ -8,6 +8,21 @@
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](#license)
 [![.NET](https://img.shields.io/badge/.NET-8.0+-512BD4.svg)](https://dotnet.microsoft.com/)
 
+## Storage v2 (package 2.0.0)
+
+Storage v2 is opt-in. Existing SSTv1 files remain readable and become immutable
+base segments; new checkpoints write small SSTv2 deltas with checksums and explicit
+delete markers. V1 remains the default. Enable `AllowStorageV2Upgrade` and call
+`WalnutDatabase.UpgradeStorageAsync()` only after all application versions allowed
+for rollback support v2. `PlanStorageUpgradeAsync()` reports the migration plan
+without rewriting data. Older 1.0.x software must not open an upgraded database.
+
+`CompactAsync()` supports input/output/rate budgets and reports `Completed` only
+after durable publication and required cleanup. Interrupted cleanup resumes on
+open. See [migration, recovery and compaction](WalnutDb/Documentation/PL/storage-v2.md).
+Tests run both formats on Windows and Linux; physical power-cut validation on the
+target eMMC/filesystem remains a deployment requirement.
+
 ## Highlights
 
 - **Power-loss safety:** WAL with per-frame CRC, truncation-tolerant replay.

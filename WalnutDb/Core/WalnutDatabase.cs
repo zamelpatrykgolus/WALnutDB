@@ -13,7 +13,7 @@ using WalnutDb.Wal;
 
 namespace WalnutDb.Core;
 
-public sealed class WalnutDatabase : IDatabase
+public sealed partial class WalnutDatabase : IDatabase
 {
     private readonly string _dir;
     private readonly DatabaseOptions _options;
@@ -23,7 +23,8 @@ public sealed class WalnutDatabase : IDatabase
     private long _nextSeqNo = 1;
     private readonly ITypeNameResolver _typeNames;
     internal IEncryption? Encryption => _options.Encryption;
-    private readonly ConcurrentDictionary<string, SstReader> _sst = new();
+    internal TimeSpan UniqueReservationTimeout => _options.UniqueReservationTimeout;
+    private readonly ConcurrentDictionary<string, ITableReader> _sst = new();
     internal readonly SemaphoreSlim WriterLock = new(1, 1);
     internal readonly AsyncReadWriteGate MaintenanceGate = new();
     private readonly FileStream _databaseLock;
@@ -77,43 +78,52 @@ public sealed class WalnutDatabase : IDatabase
         var recovered = new ConcurrentDictionary<string, MemTable>();
         var droppedTables = new HashSet<string>(StringComparer.Ordinal);
 
+        // Version validation must precede any mutating WAL recovery.
+        StorageCatalog? loadedCatalog;
+        try { loadedCatalog = StorageCatalogStore.Load(_dir, _manifest); }
+        catch (UnsupportedStorageVersionException) { throw; }
+        catch (InvalidDataException ex)
+        {
+            WalnutLogger.Warning($"Rebuilding damaged legacy manifest: {ex.Message}");
+            loadedCatalog = null;
+        }
+        if (loadedCatalog?.StorageVersion == 2 && wal is not WalWriter)
+            throw new NotSupportedException("Storage v2 requires the built-in WalWriter.");
+
         if (File.Exists(walPath))
         {
             // Tail damage is repaired by WalRecovery itself. Any other error
             // (wrong encryption key, malformed committed frame, I/O failure)
             // must stop opening the database; continuing would expose a
             // silently incomplete view.
-            WalRecovery.Replay(walPath, recovered, droppedTables, _options.Encryption);
+            WalRecovery.Replay(walPath, recovered, droppedTables, _options.Encryption,
+                loadedCatalog?.StorageVersion == 2 ? new WalPosition(loadedCatalog.CoveredWalEpoch, loadedCatalog.CoveredWalOffset) : null);
             AdoptRecoveredTables(recovered);
         }
 
         _sstDir = Path.Combine(_dir, "sst");
         Directory.CreateDirectory(_sstDir);
 
-        if (droppedTables.Count > 0)
+        if (droppedTables.Count > 0 && loadedCatalog?.StorageVersion != 2)
             PurgeDroppedArtifacts(droppedTables);
 
-        StorageCatalog? loadedCatalog;
-        try
+        if (loadedCatalog?.StorageVersion == 2)
         {
-            loadedCatalog = StorageCatalogStore.Load(_dir, _manifest);
+            var active = CopySegments(loadedCatalog);
+            foreach (var name in active.Keys.ToArray())
+                if (droppedTables.Any(t => name == t || name.StartsWith($"__index__{t}__", StringComparison.Ordinal))) active.Remove(name);
+            InstallV2Catalog(loadedCatalog with { TableSegments = active });
+            _nextSeqNo = Math.Max(_nextSeqNo, loadedCatalog.LastSequence);
+            if (_catalog.PendingDeletes.Count != 0 || _catalog.StagedFiles.Count != 0)
+                FinishV2CleanupAsync(CancellationToken.None).AsTask().GetAwaiter().GetResult();
+            CleanupV2Orphans();
         }
-        catch (UnsupportedStorageVersionException)
+        else
         {
-            _databaseLock.Dispose();
-            throw;
-        }
-        catch (InvalidDataException ex)
-        {
-            // The manifest is only metadata for storage v1. Valid WAL/SST files
-            // can reconstruct it without copying the data set.
-            WalnutLogger.Warning($"Ignoring damaged v1 manifest and rebuilding its table mapping: {ex.Message}");
-            loadedCatalog = null;
-        }
         if (loadedCatalog is not null)
         {
             _catalog = loadedCatalog;
-            _nextSeqNo = Math.Max(_nextSeqNo, loadedCatalog.LastSequence + 1);
+            _nextSeqNo = Math.Max(_nextSeqNo, loadedCatalog.LastSequence);
             foreach (var mapping in loadedCatalog.TableFiles)
             {
                 var canonical = CanonicalizeName(mapping.Key);
@@ -179,6 +189,7 @@ public sealed class WalnutDatabase : IDatabase
         }
 
         PersistCatalogAsync(CancellationToken.None).AsTask().GetAwaiter().GetResult();
+        }
 
         var legacyDangling = new List<(string IndexTable, byte[] Key)>();
         var legacySeen = new HashSet<string>(StringComparer.Ordinal);
@@ -262,6 +273,9 @@ public sealed class WalnutDatabase : IDatabase
             foreach (var reader in _sst.Values)
                 try { reader.Dispose(); } catch { }
             _sst.Clear();
+            foreach (var reader in _segmentCache.Values)
+                try { reader.Dispose(); } catch { }
+            _segmentCache.Clear();
             try { _databaseLock.Dispose(); } catch { }
             try { Wal.DisposeAsync().AsTask().GetAwaiter().GetResult(); } catch { }
             throw;
@@ -421,6 +435,12 @@ public sealed class WalnutDatabase : IDatabase
 
     internal void RemoveIndexArtifacts(string indexTableName)
     {
+        if (_catalog.StorageVersion == 2)
+        {
+            _rebuildV2Indexes[indexTableName] = true;
+            if (_sst.TryRemove(indexTableName, out var previous)) RetireReader(previous);
+            return; // retain physical inputs until the rebuilt index is published
+        }
         if (_sst.TryRemove(indexTableName, out var removed))
         {
             try { removed.Dispose(); } catch { }
@@ -471,6 +491,9 @@ public sealed class WalnutDatabase : IDatabase
             if (memRef.Current.HasTombstoneExact(primaryKey))
                 return false;
         }
+
+        if (_catalog.StorageVersion == 2)
+            return TryGetFromSst(baseTable, primaryKey, out _);
 
         if (_sst.TryGetValue(baseTable, out var sst))
         {
@@ -573,6 +596,10 @@ public sealed class WalnutDatabase : IDatabase
 
     internal bool ShouldRebuildIndex(string tableName, string indexTableName)
     {
+        // A validated empty segment is legitimate when every indexed value is
+        // null. Do not delete/rewrite it on every read-only open in either format.
+        if (_sst.ContainsKey(indexTableName))
+            return false;
         if (!TableHasLiveRows(tableName))
             return false;
 
@@ -619,6 +646,7 @@ public sealed class WalnutDatabase : IDatabase
             }
             catch (IOException ex)
             {
+                if (_catalog.StorageVersion == 2) throw;
                 WalnutLogger.Warning($"Unable to read index segment for '{indexTableName}' ({ex.Message}). It will be rebuilt from the primary table.");
                 if (_sst.TryRemove(indexTableName, out var removed))
                     removed.Dispose();
@@ -626,6 +654,7 @@ public sealed class WalnutDatabase : IDatabase
             }
             catch (Exception ex)
             {
+                if (_catalog.StorageVersion == 2) throw;
                 WalnutLogger.Warning($"Unexpected failure while scanning index '{indexTableName}': {ex.Message}. The index will be rebuilt from base data.");
                 if (_sst.TryRemove(indexTableName, out var removed))
                     removed.Dispose();
@@ -785,7 +814,7 @@ public sealed class WalnutDatabase : IDatabase
     {
         var finalIndex = sstPath + ".sxi";
         var temporaryIndex = sstPath + ".tmp.sxi";
-        if (File.Exists(finalIndex) || !File.Exists(temporaryIndex))
+        if (File.Exists(finalIndex) || !File.Exists(temporaryIndex) || File.Exists(sstPath + ".tmp"))
             return;
 
         try
@@ -803,14 +832,19 @@ public sealed class WalnutDatabase : IDatabase
 
     private async ValueTask PersistCatalogAsync(CancellationToken ct)
     {
-        _catalog = new StorageCatalog
+        if (_catalog.StorageVersion == 2) throw new InvalidOperationException("Use versioned publication for storage v2.");
+        var next = new StorageCatalog
         {
             CreatedWith = _catalog.CreatedWith,
             LastSequence = Volatile.Read(ref _nextSeqNo),
             TableFiles = _tableFiles.OrderBy(k => k.Key, StringComparer.Ordinal)
                                     .ToDictionary(k => k.Key, v => v.Value, StringComparer.Ordinal)
         };
-        await StorageCatalogStore.SaveAsync(_dir, _manifest, _catalog, ct).ConfigureAwait(false);
+        bool same = _catalog.LastSequence == next.LastSequence && _catalog.TableFiles.Count == next.TableFiles.Count &&
+            _catalog.TableFiles.All(x => next.TableFiles.TryGetValue(x.Key, out var f) && f == x.Value);
+        if (same && await _manifest.ReadCurrentAsync(ct).ConfigureAwait(false) is not null) return;
+        await StorageCatalogStore.SaveAsync(_dir, _manifest, next, ct, Fault).ConfigureAwait(false);
+        _catalog = next;
     }
 
     internal MemTableRef ReattachIndex(string indexTableName, MemTableRef preferred, bool unique)
@@ -852,6 +886,7 @@ public sealed class WalnutDatabase : IDatabase
             {
                 transientError = ex;
             }
+            catch (ObjectDisposedException) { Thread.Yield(); continue; }
 
             Thread.Sleep(1);
         }
@@ -888,6 +923,7 @@ public sealed class WalnutDatabase : IDatabase
                 Thread.Sleep(1);
                 continue;
             }
+            catch (ObjectDisposedException) { Thread.Yield(); continue; }
 
             while (hasCurrent)
             {
@@ -906,7 +942,7 @@ public sealed class WalnutDatabase : IDatabase
     private void ReplaceSst(string name, string newPath)
     {
         var reader = new SstReader(newPath);
-        SstReader? replaced = null;
+        ITableReader? replaced = null;
         _sst.AddOrUpdate(name, reader, (_, old) =>
         {
             replaced = old;
@@ -1054,7 +1090,20 @@ public sealed class WalnutDatabase : IDatabase
         // has been truncated. MemTables stay attached until every SST succeeds,
         // so cancellation/failure cannot make live data disappear in-process.
         await using var maintenanceLease = await MaintenanceGate.EnterWriteAsync(ct).ConfigureAwait(false);
-        var snapshot = _tables.ToArray();
+        ThrowIfMaintenanceFailed();
+        if (_catalog.StorageVersion == 2)
+        {
+            await CheckpointV2Async(ct).ConfigureAwait(false);
+            return;
+        }
+        try
+        {
+        var snapshot = _tables.Where(t => t.Value.Current.IsDirty).ToArray();
+        if (snapshot.Length == 0)
+        {
+            Interlocked.Increment(ref _skippedCheckpoints);
+            return;
+        }
 
         foreach (var entry in snapshot)
         {
@@ -1073,12 +1122,15 @@ public sealed class WalnutDatabase : IDatabase
 
             try
             {
-                await SstWriter.WriteAsync(tmp, StreamCheckpointRows(name, mem, isIndex, isUniqueIndex, ct), ct).ConfigureAwait(false);
+                await SstWriter.WriteAsync(tmp, StreamCheckpointRows(name, mem, isIndex, isUniqueIndex, ct), ct, Fault).ConfigureAwait(false);
+                Interlocked.Add(ref _sstBytesWritten, new FileInfo(tmp).Length);
                 // Remove the old optional sidecar before replacing data. This makes
                 // every crash point safe: old data without an index or new data
                 // without an index are both readable by a full scan.
                 TryDeleteFile(dst + ".sxi");
-                if (File.Exists(dst)) File.Replace(tmp, dst, null); else File.Move(tmp, dst);
+                Fault("segment.before-rename");
+                DurableFile.Move(tmp, dst);
+                Fault("segment.after-rename");
                 ReplaceSst(name, dst);
                 PromoteSstSidecar(tmp + ".sxi", dst + ".sxi");
                 if (File.Exists(dst + ".sxi"))
@@ -1109,8 +1161,13 @@ public sealed class WalnutDatabase : IDatabase
             WriterLock.Release();
         }
 
-        await Wal.FlushAsync(ct).ConfigureAwait(false);
+        Fault("wal.before-truncate");
         await Wal.TruncateAsync(ct).ConfigureAwait(false);
+        Fault("wal.after-truncate");
+        Interlocked.Increment(ref _checkpointCount);
+        }
+        catch (OperationCanceledException) { throw; } // v1 retains idempotent WAL and attached dirty data until publication
+        catch (Exception ex) { _maintenanceFailure = ex; throw; }
     }
 
     private async IAsyncEnumerable<(byte[] Key, byte[] Val)> StreamCheckpointRows(
@@ -1240,9 +1297,9 @@ public sealed class WalnutDatabase : IDatabase
         }
 
         if (File.Exists(finalIndex))
-            File.Replace(temporaryIndex, finalIndex, destinationBackupFileName: null);
+            DurableFile.Move(temporaryIndex, finalIndex);
         else
-            File.Move(temporaryIndex, finalIndex);
+            DurableFile.Move(temporaryIndex, finalIndex);
     }
 
     public ValueTask<DbStats> GetStatsAsync(CancellationToken ct = default)
@@ -1292,10 +1349,10 @@ public sealed class WalnutDatabase : IDatabase
 
             if (_sst.TryGetValue(name, out var sst))
             {
-                sstCount = 1;
+                sstCount = sst is SegmentSetReader set ? set.Files.Count : 1;
                 try
                 {
-                    sstSizeBytes = new FileInfo(sst.Path).Length;
+                    sstSizeBytes = sst is SegmentSetReader segments ? segments.Files.Sum(file => file.Bytes) : new FileInfo(sst.Path).Length;
                 }
                 catch { /* ignore */ }
 
@@ -1328,6 +1385,7 @@ public sealed class WalnutDatabase : IDatabase
 
     public async ValueTask<BackupResult> CreateBackupAsync(string targetDir, CancellationToken ct = default)
     {
+        ThrowIfMaintenanceFailed();
         var sourceFull = Path.GetFullPath(_dir).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
         var targetFull = Path.GetFullPath(targetDir).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
         if (targetFull.StartsWith(sourceFull, StringComparison.OrdinalIgnoreCase) ||
@@ -1349,7 +1407,11 @@ public sealed class WalnutDatabase : IDatabase
         long copied = 0;
 
         // 2) Skopiuj wszystkie *.sst (snapshot listy; kopiuj z Share Read/Write)
-        var sourceSstArtifacts = Directory.EnumerateFiles(_sstDir)
+        var sourceSstArtifacts = (_catalog.StorageVersion == 2
+            ? _catalog.TableSegments.Values.SelectMany(files => files).SelectMany(file => file.Format == 1
+                ? new[] { Path.Combine(_sstDir, file.FileName), Path.Combine(_sstDir, file.FileName + ".sxi") }
+                : new[] { Path.Combine(_sstDir, file.FileName) }).Where(File.Exists)
+            : Directory.EnumerateFiles(_sstDir))
             .Where(path => path.EndsWith(".sst", StringComparison.OrdinalIgnoreCase) ||
                            path.EndsWith(".sst.sxi", StringComparison.OrdinalIgnoreCase))
             .ToArray();
@@ -1389,7 +1451,9 @@ public sealed class WalnutDatabase : IDatabase
         }
 
         // Manifest and CURRENT are part of the consistency boundary.
-        var sourceManifests = Directory.EnumerateFiles(_dir, "MANIFEST-*").ToArray();
+        var sourceManifests = _catalog.StorageVersion == 2
+            ? new[] { Path.Combine(_dir, (await _manifest.ReadCurrentAsync(ct).ConfigureAwait(false))!) }
+            : Directory.EnumerateFiles(_dir, "MANIFEST-*").Where(path => !path.EndsWith(".tmp", StringComparison.Ordinal)).ToArray();
         var sourceManifestNames = new HashSet<string>(sourceManifests.Select(path => Path.GetFileName(path)!), StringComparer.OrdinalIgnoreCase);
         foreach (var mf in sourceManifests)
         {
@@ -1423,7 +1487,10 @@ public sealed class WalnutDatabase : IDatabase
             if (!sourceManifestNames.Contains(Path.GetFileName(stale)))
                 File.Delete(stale);
 
+        DurableFile.SyncDirectory(targetSstDir);
+        DurableFile.SyncDirectory(targetDir);
         File.Delete(incompleteMarker);
+        DurableFile.SyncDirectory(targetDir);
 
         return new BackupResult(targetDir, copied);
     }
@@ -1451,6 +1518,14 @@ public sealed class WalnutDatabase : IDatabase
         if (mode is not DefragMode.Compact and not DefragMode.RebuildSwap)
             throw new ArgumentOutOfRangeException(nameof(mode));
 
+        if (_catalog.StorageVersion == 2)
+        {
+            foreach (var name in _catalog.TableSegments.Keys.ToArray())
+                if (mode == DefragMode.RebuildSwap || _catalog.TableSegments[name].Any(f => f.Format == 2 && !f.IsBase))
+                    await CompactAsync(name, new CompactionOptions { IncludeBaseSegments = mode == DefragMode.RebuildSwap }, ct).ConfigureAwait(false);
+            return;
+        }
+
         // With one SST per table, a checkpoint already produces the compact,
         // tombstone-free representation. Reusing the single safe implementation
         // also avoids ciphertext double-encryption and concurrent-write loss.
@@ -1469,7 +1544,7 @@ public sealed class WalnutDatabase : IDatabase
             return;
 
         Exception? checkpointError = null;
-        if (_options.CheckpointOnDispose)
+        if (_options.CheckpointOnDispose && _maintenanceFailure is null)
         {
             try
             {
@@ -1483,6 +1558,9 @@ public sealed class WalnutDatabase : IDatabase
             }
         }
 
+        var shutdownLease = await MaintenanceGate.EnterWriteAsync().ConfigureAwait(false);
+        try
+        {
         foreach (var s in _sst.Values)
             try
             {
@@ -1490,14 +1568,21 @@ public sealed class WalnutDatabase : IDatabase
             }
             catch { }
         _sst.Clear();
-        await Wal.DisposeAsync().ConfigureAwait(false);
+        foreach (var reader in _segmentCache.Values) reader.Dispose();
+        _segmentCache.Clear();
+        try { await Wal.DisposeAsync().ConfigureAwait(false); }
+        catch (Exception ex) { checkpointError ??= ex; }
 
         if (_options.Encryption is IDisposable disp)
             disp.Dispose();
-
+        }
+        finally
+        {
+        shutdownLease.Dispose();
         _databaseLock.Dispose();
         MaintenanceGate.Dispose();
         WriterLock.Dispose();
+        }
 
         if (checkpointError is not null)
             throw new IOException("Checkpoint-on-dispose failed; WAL was preserved for recovery.", checkpointError);
@@ -1520,8 +1605,10 @@ public sealed class WalnutDatabase : IDatabase
 
     public async ValueTask DropTableAsync(string name, CancellationToken ct = default)
     {
-        await using var maintenanceLease = await MaintenanceGate.EnterReadAsync(ct).ConfigureAwait(false);
+        await using var maintenanceLease = await MaintenanceGate.EnterWriteAsync(ct).ConfigureAwait(false);
+        ThrowIfMaintenanceFailed();
         name = CanonicalizeName(name);
+        if (_catalog.StorageVersion == 2) { await DropV2Async(name, ct).ConfigureAwait(false); return; }
 
         var txId = (ulong)(Random.Shared.NextInt64() & long.MaxValue);
         var seq = (ulong)Interlocked.Increment(ref _nextSeqNo);
@@ -1721,6 +1808,7 @@ public sealed class WalnutDatabase : IDatabase
     public async ValueTask<ITransaction> BeginTransactionAsync(CancellationToken ct = default)
     {
         ObjectDisposedException.ThrowIf(IsDisposing, this);
+        ThrowIfMaintenanceFailed();
         var txId = (ulong)(Random.Shared.NextInt64() & long.MaxValue);
         var seq = (ulong)Interlocked.Increment(ref _nextSeqNo);
         await Task.Yield();

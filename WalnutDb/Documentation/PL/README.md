@@ -7,6 +7,7 @@ Witaj w dokumentacji **WalnutDb** — lekkiej bazy typu *LSM* (memtable + SST), 
 - [Architektura](architecture.md)
 - [Warstwa przechowywania](storage.md)
 - [Wersje formatu i migracje](storage-versions.md)
+- [Storage v2: migracja, delty i compaction](storage-v2.md)
 - [Transakcje i WAL](transactions.md)
 - [Indeksy](indexing.md)
 - [Unikalność i współbieżność](uniqueness.md)

@@ -1,5 +1,6 @@
 ﻿#nullable enable
 using System.Text;
+using WalnutDb.Storage;
 
 namespace WalnutDb;
 
@@ -18,7 +19,10 @@ public sealed class FileSystemManifestStore : IManifestStore
     public FileSystemManifestStore(string directory)
     {
         _directory = directory;
+        bool existed = Directory.Exists(directory);
         Directory.CreateDirectory(directory);
+        if (!existed)
+            DurableFile.SyncDirectory(Path.GetDirectoryName(Path.GetFullPath(directory))!);
         _currentPath = Path.Combine(directory, "CURRENT");
     }
 
@@ -39,6 +43,7 @@ public sealed class FileSystemManifestStore : IManifestStore
 
     public async ValueTask WriteCurrentAsync(string manifestName, CancellationToken ct = default)
     {
+        if (await ReadCurrentAsync(ct).ConfigureAwait(false) == manifestName) return;
         var tmp = _currentPath + ".tmp";
 
         // Zapisz do pliku tymczasowego i utrwal na dysku
@@ -55,24 +60,7 @@ public sealed class FileSystemManifestStore : IManifestStore
             fs.Flush(true); // trwałe zapisanie zawartości TMP
         }
 
-        // Atomowa podmiana
-        if (OperatingSystem.IsWindows())
-        {
-            if (File.Exists(_currentPath))
-            {
-                // File.Replace jest atomowe na Windows
-                File.Replace(tmp, _currentPath, destinationBackupFileName: null, ignoreMetadataErrors: true);
-            }
-            else
-            {
-                File.Move(tmp, _currentPath, overwrite: true);
-            }
-        }
-        else
-        {
-            // POSIX rename() jest atomowe w obrębie tego samego FS
-            File.Move(tmp, _currentPath, overwrite: true);
-        }
+        DurableFile.Move(tmp, _currentPath);
     }
 
     public ValueTask<bool> ValidateManifestAsync(string path, CancellationToken ct = default)

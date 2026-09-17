@@ -2,6 +2,10 @@
 
 ## Aktualny format
 
+Od biblioteki 2.0.0 dostępny jest także jawnie aktywowany [storage v2](storage-v2.md),
+z mieszanym odczytem SSTv1/SSTv2, przyrostowymi checkpointami i kontrolowaną compaction.
+Poniższy opis dotyczy domyślnego trybu v1. Otwarcie bazy nie aktywuje v2 automatycznie.
+
 WalnutDb zachowuje binarne formaty `WALv1` i `SSTv1`. Poprawki bezpieczeństwa nie wymagają przepisywania istniejących tabel.
 
 Przy pierwszym otwarciu bazy bez pliku `CURRENT` tworzony jest mały manifest `MANIFEST-000001.json`. Zawiera wersję formatu oraz mapowanie logicznych nazw tabel na istniejące pliki SST. Jest to migracja wyłącznie metadanych: pliki WAL i SST nie są kopiowane, przemianowywane ani ponownie szyfrowane.

@@ -6,7 +6,7 @@ namespace WalnutDb.Sst
     {
         private static readonly byte[] Header = new byte[] { (byte)'S', (byte)'S', (byte)'T', (byte)'v', (byte)'1', 0, 0, 0 };
 
-        public static async ValueTask WriteAsync(string path, IAsyncEnumerable<(byte[] Key, byte[] Val)> sorted, CancellationToken ct = default)
+        public static async ValueTask WriteAsync(string path, IAsyncEnumerable<(byte[] Key, byte[] Val)> sorted, CancellationToken ct = default, Action<string>? fault = null)
         {
             Directory.CreateDirectory(Path.GetDirectoryName(path)!);
             var idxPath = path + ".sxi";
@@ -19,9 +19,11 @@ namespace WalnutDb.Sst
                 Mode = FileMode.Create,
                 Access = FileAccess.Write,
                 Share = FileShare.Read,
-                Options = FileOptions.WriteThrough
+                Options = FileOptions.SequentialScan,
+                BufferSize = 64 * 1024
             });
 
+            fault?.Invoke("segment.before-write");
             await fs.WriteAsync(Header, 0, Header.Length, ct).ConfigureAwait(false);
 
             uint count = 0;
@@ -42,6 +44,7 @@ namespace WalnutDb.Sst
                 await fs.WriteAsync(k, 0, k.Length, ct).ConfigureAwait(false);
                 await fs.WriteAsync(v, 0, v.Length, ct).ConfigureAwait(false);
                 count++;
+                fault?.Invoke("segment.after-record");
 
                 // co N-ty rekord – kotwica indeksu
                 if ((count % SstIndex.DefaultStride) == 0)
@@ -56,7 +59,9 @@ namespace WalnutDb.Sst
             var trailer = new byte[4];
             WriteUInt32LE(trailer, 0, count);
             await fs.WriteAsync(trailer, 0, 4, ct).ConfigureAwait(false);
+            fault?.Invoke("segment.before-sync");
             fs.Flush(true);
+            fault?.Invoke("segment.after-sync");
 
             // —— zapisz indeks poboczny (best-effort) ——
             try

@@ -9,6 +9,11 @@ internal sealed class MemTable
     private readonly ReaderWriterLockSlim _rw = new(LockRecursionPolicy.NoRecursion);
     private readonly SortedDictionary<byte[], Entry> _map = new(ByteArrayComparer.Instance);
 
+    public bool IsDirty
+    {
+        get { _rw.EnterReadLock(); try { return _map.Count != 0; } finally { _rw.ExitReadLock(); } }
+    }
+
     internal readonly struct Entry
     {
         public readonly byte[]? Value;

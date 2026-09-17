@@ -183,7 +183,7 @@ public sealed class UniqueIndexStressTests
         var tA = tbl.UpsertAsync(new UxStressUser { Id = "A", Email = "F" }).AsTask();
         var tB = tbl.UpsertAsync(new UxStressUser { Id = "B", Email = "E" }).AsTask();
 
-        await Task.WhenAll(tA.ContinueWith(_ => { }), tB.ContinueWith(_ => { }));
+        await Task.WhenAll(tA, tB);
         await db.CheckpointAsync();
 
         var a = await tbl.GetAsync("A");

@@ -61,6 +61,8 @@ internal sealed class DefaultTable<T> : ITable<T>
 
     private void EnsureTableRegistered()
     {
+        ObjectDisposedException.ThrowIf(_db.IsDisposing, _db);
+        _db.ThrowIfMaintenanceFailed();
         _memRef = _db.ReattachTable(_name, _memRef);
 
         foreach (var idx in _indexes)
@@ -294,7 +296,7 @@ internal sealed class DefaultTable<T> : ITable<T>
                 {
                     ct.ThrowIfCancellationRequested();
 
-                    if (sw.Elapsed > TimeSpan.FromMilliseconds(300))
+                    if (sw.Elapsed > _db.UniqueReservationTimeout)
                         throw new InvalidOperationException($"Unique index '{idx.Name}' violation for value '{newValObj}'.");
 
                     spin.SpinOnce();
@@ -472,7 +474,7 @@ internal sealed class DefaultTable<T> : ITable<T>
         return true;
     }
 
-    public async ValueTask<bool> DeleteAsync(object id, ITransaction txHandle, CancellationToken ct = default)
+    public ValueTask<bool> DeleteAsync(object id, ITransaction txHandle, CancellationToken ct = default)
     {
         EnsureTableRegistered();
 
@@ -546,7 +548,7 @@ internal sealed class DefaultTable<T> : ITable<T>
         }
 
         // ⬇⬇⬇ to jest klucz do stabilności testu RW
-        return hasOld;
+        return ValueTask.FromResult(hasOld);
     }
 
     public ValueTask<bool> DeleteAsync(T item, ITransaction txHandle, CancellationToken ct = default)
@@ -701,8 +703,8 @@ internal sealed class DefaultTable<T> : ITable<T>
         var to = toExclusive.IsEmpty ? Array.Empty<byte>() : toExclusive.ToArray();
         var after = token.IsEmpty ? null : token.ToArray();
 
-        var memEnum = _memRef.Current.SnapshotRange(from, to, after).GetEnumerator();
-        var sstEnum = _db.ScanSstRange(_name, from, to).GetEnumerator();
+        using var memEnum = _memRef.Current.SnapshotRange(from, to, after).GetEnumerator();
+        using var sstEnum = _db.ScanSstRange(_name, from, to).GetEnumerator();
 
         bool hasMem = memEnum.MoveNext();
         bool hasSst = sstEnum.MoveNext();
@@ -728,8 +730,11 @@ internal sealed class DefaultTable<T> : ITable<T>
                         yield return _map.Deserialize(rec.Value.Value);
                         if (++sent >= pageSize) { sent = 0; await Task.Yield(); }
                     }
-                    lastKey = rec.Key;
                 }
+
+                // A snapshot tombstone must suppress the older SST row even if
+                // checkpoint has replaced Current while this scan was suspended.
+                lastKey = rec.Key;
 
                 if (hasSst && lastKey is not null && ByteCompare(lastKey, sstEnum.Current.Key) == 0)
                     hasSst = sstEnum.MoveNext();
@@ -768,8 +773,8 @@ internal sealed class DefaultTable<T> : ITable<T>
         var to = hint.End.IsEmpty ? Array.Empty<byte>() : hint.End.ToArray();
         var after = token.IsEmpty ? null : token.ToArray();
 
-        var memEnum = idx.Mem.Current.SnapshotRange(from, to, after).GetEnumerator();
-        var sstEnum = _db.ScanSstRange(idx.IndexTableName, from, to).GetEnumerator();
+        using var memEnum = idx.Mem.Current.SnapshotRange(from, to, after).GetEnumerator();
+        using var sstEnum = _db.ScanSstRange(idx.IndexTableName, from, to).GetEnumerator();
 
         bool hasMem = memEnum.MoveNext();
         bool hasSst = sstEnum.MoveNext();

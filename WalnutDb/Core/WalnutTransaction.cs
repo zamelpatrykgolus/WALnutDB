@@ -46,10 +46,17 @@ internal sealed class WalnutTransaction : WalnutDb.ITransaction
             throw;
         }
         await using var _ = maintenanceLease;
+        _db.ThrowIfMaintenanceFailed();
         if (_db.IsDisposing)
         {
             Interlocked.CompareExchange(ref _state, Active, Committing);
             throw new ObjectDisposedException(nameof(WalnutDatabase));
+        }
+
+        if (_ops == 0)
+        {
+            Volatile.Write(ref _state, Committed);
+            return;
         }
 
         var commitFrames = new List<ReadOnlyMemory<byte>>(_frames.Count + 2)
@@ -60,14 +67,20 @@ internal sealed class WalnutTransaction : WalnutDb.ITransaction
         commitFrames.Add(Wal.WalCodec.BuildCommit(_txId, _ops));
 
         CommitHandle handle;
+        try { await _db.WriterLock.WaitAsync(ct).ConfigureAwait(false); }
+        catch { Interlocked.CompareExchange(ref _state, Active, Committing); throw; }
         try
         {
+            // Keep WAL enqueue order identical to MemTable apply order, including
+            // concurrent commits of the same key and Fast/Safe mixtures.
             // Wyślij całą transakcję do WAL
             handle = await _db.Wal.AppendTransactionAsync(commitFrames, durability, ct).ConfigureAwait(false);
 
             // Trwałość: dla Safe/Group poczekaj aż batch zostanie zfsyncowany
             if (durability is WalnutDb.Durability.Safe or WalnutDb.Durability.Group)
                 await handle.WhenCommitted.ConfigureAwait(false);
+            foreach (var act in _applyActions) act();
+            Volatile.Write(ref _state, Committed);
         }
         catch
         {
@@ -75,14 +88,6 @@ internal sealed class WalnutTransaction : WalnutDb.ITransaction
             throw;
         }
 
-        // COMMIT może być już trwały. Od tej chwili anulowanie nie może
-        // pozostawić bieżącego procesu ze stanem innym niż recovery po restarcie.
-        await _db.WriterLock.WaitAsync(CancellationToken.None).ConfigureAwait(false);
-        try
-        {
-            foreach (var act in _applyActions) act();
-            Volatile.Write(ref _state, Committed);
-        }
         finally
         {
             _db.WriterLock.Release();

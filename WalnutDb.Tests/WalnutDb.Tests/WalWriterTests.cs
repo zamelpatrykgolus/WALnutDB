@@ -14,6 +14,23 @@ namespace WalnutDb.Tests;
 
 public sealed class WalWriterTests
 {
+    [Fact]
+    public async Task ReopenedWal_FirstBarrierSyncsExistingData_ThenNoOpFlushSkipsRedundantSync()
+    {
+        var dir = NewTempDir();
+        var path = Path.Combine(dir, "wal.log");
+        await using (var first = new WalWriter(path))
+        {
+            var handle = await first.AppendTransactionAsync(SimpleTx(), Durability.Fast);
+            await handle.WhenCommitted;
+        }
+        await using var reopened = new WalWriter(path);
+        await reopened.FlushAsync();
+        Assert.Equal(1, reopened.DurableFlushCount);
+        await reopened.FlushAsync();
+        Assert.Equal(1, reopened.DurableFlushCount);
+    }
+
     private static string NewTempDir()
     {
         var dir = Path.Combine(Path.GetTempPath(), "WalnutDbTests", Guid.NewGuid().ToString("N"));

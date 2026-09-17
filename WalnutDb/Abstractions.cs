@@ -46,6 +46,16 @@ public sealed class DatabaseOptions
     /// Migracja pozostaje metadana-only i nie zmienia wskazanego SST.
     /// </summary>
     public IReadOnlyDictionary<string, string>? LegacyTableNameMappings { get; init; }
+
+    /// <summary>Explicit deployment gate for UpgradeStorageAsync. Does not migrate on open.</summary>
+    public bool AllowStorageV2Upgrade { get; init; }
+    public long MaintenanceReserveBytes { get; init; } = 1024 * 1024;
+    public int MaxSegmentsPerTable { get; init; } = 64;
+    /// <summary>Bounded wait for a concurrent owner to release a unique value on slow storage.</summary>
+    public TimeSpan UniqueReservationTimeout { get; init; } = TimeSpan.FromSeconds(2);
+    // Per-instance deterministic fault injection, accessible only to the test assemblies.
+    internal Action<string>? StorageFault { get; init; }
+    internal Func<long>? AvailableSpaceOverride { get; init; }
 }
 
 /// <summary>

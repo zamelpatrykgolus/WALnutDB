@@ -18,7 +18,8 @@ internal static class WalRecovery
     public static void Replay(string walPath,
                               ConcurrentDictionary<string, MemTable> tables,
                               ISet<string> droppedTables,
-                              IEncryption? encryption = null)
+                              IEncryption? encryption = null,
+                              Wal.WalPosition? covered = null)
     {
         if (!File.Exists(walPath)) return;
 
@@ -30,6 +31,26 @@ internal static class WalRecovery
             Options = FileOptions.SequentialScan
         });
 
+        var epoch = Wal.WalEpoch.Read(fs);
+        if (covered is not null && epoch.Epoch == Guid.Empty && fs.Length > 0)
+        {
+            // During metadata-only migration a v2 catalog can still reference a
+            // legacy WAL. It must start with an intact legacy BEGIN, not with a
+            // damaged epoch header reinterpreted as a discardable torn tail.
+            fs.Position = 0;
+            var begin = new byte[25];
+            if (fs.ReadAtLeast(begin, begin.Length, throwOnEndOfStream: false) != begin.Length ||
+                BinaryPrimitives.ReadInt32LittleEndian(begin) != 17 || begin[4] != (byte)Wal.WalOp.Begin ||
+                BinaryPrimitives.ReadUInt32LittleEndian(begin.AsSpan(21)) != new Crc32().Compute(begin.AsSpan(4, 17)))
+                throw new InvalidDataException("Unknown or damaged WAL header in storage v2; refusing destructive tail repair.");
+        }
+        fs.Position = epoch.Offset;
+        if (covered is { } boundary && boundary.Epoch == epoch.Epoch)
+        {
+            if (boundary.Offset < epoch.Offset || boundary.Offset > fs.Length)
+                throw new InvalidDataException("WAL is shorter than its durable checkpoint boundary.");
+            fs.Position = boundary.Offset;
+        }
         var crc = new Crc32();
 
         // Bufory przeniesione poza pętlę (CA2014)
@@ -38,7 +59,7 @@ internal static class WalRecovery
 
         // TxId -> lista operacji do zastosowania przy commit
         var pending = new Dictionary<ulong, List<Action>>();
-        long lastGoodPosition = 0;
+        long lastGoodPosition = fs.Position;
         bool truncateTail = false;
         bool issueMayBeTail = true;
 
@@ -289,6 +310,7 @@ internal static class WalRecovery
                 catch (Exception ex)
                 {
                     WalnutLogger.Exception(ex);
+                    throw new IOException("Cannot durably repair WAL tail.", ex);
                 }
             }
             else

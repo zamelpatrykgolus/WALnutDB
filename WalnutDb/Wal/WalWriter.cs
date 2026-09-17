@@ -2,6 +2,7 @@
 using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Threading.Channels;
+using WalnutDb.Storage;
 
 namespace WalnutDb.Wal;
 
@@ -15,7 +16,10 @@ internal sealed record WalItem(IReadOnlyList<ReadOnlyMemory<byte>> Frames,
 /// </summary>
 public sealed class WalWriter : IWalWriter
 {
-    private readonly FileStream _fs;
+    private FileStream _fs;
+    private Guid _epoch;
+    private bool _needsSync;
+    internal long DurableFlushCount { get; private set; }
     private readonly Channel<WalItem> _queue;
     private readonly TimeSpan _groupWindow;
     private readonly int _maxBatch;
@@ -42,7 +46,12 @@ public sealed class WalWriter : IWalWriter
             Share = FileShare.ReadWrite, // pozwól recovery otworzyć uchwyt RW (truncate)
             Options = FileOptions.Asynchronous | FileOptions.SequentialScan
         });
+        try { _epoch = WalEpoch.Read(_fs).Epoch; }
+        catch { _fs.Dispose(); throw; }
         _fs.Seek(0, SeekOrigin.End);
+        // Existing data may have survived a process crash only in the OS cache
+        // (Fast). The first explicit durable barrier must cover it as well.
+        _needsSync = _fs.Length > (_epoch == Guid.Empty ? 0 : WalEpoch.HeaderLength);
         _loop = Task.Run(WriterLoopAsync);
     }
 
@@ -55,10 +64,9 @@ public sealed class WalWriter : IWalWriter
         try
         {
             // wyzeruj plik
-            _fs.Flush(true);
             _fs.Position = 0;
             _fs.SetLength(0);
-            _fs.Flush(true);
+            SyncData();
         }
         catch (Exception ex)
         {
@@ -98,9 +106,12 @@ public sealed class WalWriter : IWalWriter
                 pending.Clear();
                 if (reader.TryRead(out var first)) pending.Add(first);
 
-                var sw = ValueStopwatch.StartNew();
-                while (pending.Count < _maxBatch && sw.Elapsed < _groupWindow && reader.TryRead(out var item))
-                    pending.Add(item);
+                // Group waits for arrivals during the configured window. Safe
+                // and explicit barriers never add this batching latency.
+                if (first is not null && first.Durability == Durability.Group && _groupWindow > TimeSpan.Zero)
+                    await Task.Delay(_groupWindow, _cts.Token).ConfigureAwait(false);
+                while (pending.Count < _maxBatch && reader.TryRead(out var queued))
+                    pending.Add(queued);
 
                 await _ioGate.WaitAsync(_cts.Token).ConfigureAwait(false);
                 try
@@ -114,13 +125,19 @@ public sealed class WalWriter : IWalWriter
 
                     foreach (var item in pending)
                         foreach (var frame in item.Frames)
+                        {
                             await WriteFrameAsync(frame, _cts.Token).ConfigureAwait(false);
+                            _needsSync = true;
+                        }
 
                     // Safe/Group commits and explicit barriers request durable
                     // media flush. Fast-only batches remain in OS buffers until
                     // a later durable operation or orderly disposal.
-                    if (pending.Any(item => item.Durability != Durability.Fast))
-                        _fs.Flush(true);
+                    if (_needsSync && pending.Any(item => item.Durability != Durability.Fast))
+                    {
+                        SyncData();
+                        _needsSync = false;
+                    }
                     else
                         await _fs.FlushAsync(_cts.Token).ConfigureAwait(false);
 
@@ -199,6 +216,12 @@ public sealed class WalWriter : IWalWriter
             throw new IOException("The WAL writer is faulted.", _faultException);
     }
 
+    private void SyncData()
+    {
+        _fs.Flush(true);
+        DurableFlushCount++;
+    }
+
     public async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _disposeOnce, 1) != 0)
@@ -220,13 +243,57 @@ public sealed class WalWriter : IWalWriter
         catch { /* ignore */ }
 
         // Dokończ IO
-        try { _fs.Flush(true); } catch { /* ignore */ }
+        Exception? shutdownError = null;
+        try { if (_needsSync) SyncData(); } catch (Exception ex) { shutdownError = ex; }
         try { await _fs.DisposeAsync().ConfigureAwait(false); } catch { /* ignore */ }
 
         // Na końcu sprzątnij CTS
         try { _cts.Dispose(); } catch { /* ignore */ }
         try { _ioGate.Dispose(); } catch { /* ignore */ }
 
+        if (shutdownError is not null) throw new IOException("Failed to durably drain the WAL.", shutdownError);
+
+    }
+
+    internal async ValueTask<WalPosition> CaptureAsync(CancellationToken ct)
+    {
+        await FlushAsync(ct).ConfigureAwait(false);
+        await _ioGate.WaitAsync(ct).ConfigureAwait(false);
+        try { return new(_epoch, _fs.Length); }
+        finally { _ioGate.Release(); }
+    }
+
+    // Called only while the database maintenance gate excludes all commits.
+    internal async ValueTask RotateAsync(Action<string>? fault, CancellationToken ct)
+    {
+        await FlushAsync(ct).ConfigureAwait(false);
+        await _ioGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            var epoch = Guid.NewGuid();
+            var temp = _path + ".rotate.tmp";
+            await using (var output = new FileStream(temp, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                await output.WriteAsync(WalEpoch.Header(epoch), ct).ConfigureAwait(false);
+                output.Flush(true);
+            }
+            fault?.Invoke("wal.before-rotate");
+            _fs.Dispose();
+            DurableFile.Move(temp, _path);
+            _fs = new FileStream(_path, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite,
+                4096, FileOptions.Asynchronous | FileOptions.SequentialScan);
+            _fs.Seek(0, SeekOrigin.End);
+            _epoch = epoch;
+            _needsSync = false;
+            fault?.Invoke("wal.after-rotate");
+        }
+        catch (Exception ex)
+        {
+            _faultException = ex;
+            Volatile.Write(ref _faulted, 1);
+            throw;
+        }
+        finally { _ioGate.Release(); }
     }
 }
 

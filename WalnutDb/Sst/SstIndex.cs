@@ -17,7 +17,8 @@ namespace WalnutDb.Sst
                 Mode = FileMode.Create,
                 Access = FileAccess.Write,
                 Share = FileShare.Read,
-                Options = FileOptions.WriteThrough
+                Options = FileOptions.SequentialScan,
+                BufferSize = 64 * 1024
             });
 
             var u32 = new byte[4];
